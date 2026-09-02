@@ -252,6 +252,86 @@ static SECURITY_ATTRIBUTES* NamedObjSa()
     return &sa;
 }
 
+// ------------------------------------------------- RAII resource wrappers
+// Every early return frees its resources through these — no manual cleanup
+// paths to get wrong.
+
+struct ScopedHandle {                 // CloseHandle (NULL/INVALID = empty)
+    HANDLE h = nullptr;
+    ScopedHandle() = default;
+    explicit ScopedHandle(HANDLE v) : h(v) {}
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+    ~ScopedHandle() { reset(); }
+    bool valid() const { return h && h != INVALID_HANDLE_VALUE; }
+    void reset(HANDLE v = nullptr) { if (valid()) CloseHandle(h); h = v; }
+};
+
+struct ScopedWlan {                   // WlanCloseHandle
+    HANDLE h = nullptr;
+    explicit ScopedWlan(HANDLE v = nullptr) : h(v) {}
+    ScopedWlan(const ScopedWlan&) = delete;
+    ScopedWlan& operator=(const ScopedWlan&) = delete;
+    ~ScopedWlan() { reset(); }
+    void reset(HANDLE v = nullptr) { if (h) WlanCloseHandle(h, nullptr); h = v; }
+};
+
+struct ScopedWlanMem {                // WlanFreeMemory
+    void* p = nullptr;
+    ScopedWlanMem() = default;
+    ScopedWlanMem(const ScopedWlanMem&) = delete;
+    ScopedWlanMem& operator=(const ScopedWlanMem&) = delete;
+    ~ScopedWlanMem() { if (p) WlanFreeMemory(p); }
+    template <typename T> T* as() const { return static_cast<T*>(p); }
+};
+
+struct ScopedWinHttp {                // WinHttpCloseHandle
+    HINTERNET h = nullptr;
+    explicit ScopedWinHttp(HINTERNET v) : h(v) {}
+    ScopedWinHttp(const ScopedWinHttp&) = delete;
+    ScopedWinHttp& operator=(const ScopedWinHttp&) = delete;
+    ~ScopedWinHttp() { if (h) WinHttpCloseHandle(h); }
+};
+
+struct ScopedSvc {                    // CloseServiceHandle
+    SC_HANDLE h = nullptr;
+    explicit ScopedSvc(SC_HANDLE v) : h(v) {}
+    ScopedSvc(const ScopedSvc&) = delete;
+    ScopedSvc& operator=(const ScopedSvc&) = delete;
+    ~ScopedSvc() { if (h) CloseServiceHandle(h); }
+};
+
+struct ScopedDevInfo {                // SetupDiDestroyDeviceInfoList
+    HDEVINFO h = INVALID_HANDLE_VALUE;
+    explicit ScopedDevInfo(HDEVINFO v) : h(v) {}
+    ScopedDevInfo(const ScopedDevInfo&) = delete;
+    ScopedDevInfo& operator=(const ScopedDevInfo&) = delete;
+    ~ScopedDevInfo() { if (h != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(h); }
+};
+
+struct ScopedRegKey {                 // RegCloseKey
+    HKEY k = nullptr;
+    explicit ScopedRegKey(HKEY v) : k(v) {}
+    ScopedRegKey(const ScopedRegKey&) = delete;
+    ScopedRegKey& operator=(const ScopedRegKey&) = delete;
+    ~ScopedRegKey() { if (k && k != (HKEY)INVALID_HANDLE_VALUE) RegCloseKey(k); }
+};
+
+struct ScopedIcmp {                   // IcmpCloseHandle
+    HANDLE h = INVALID_HANDLE_VALUE;
+    explicit ScopedIcmp(HANDLE v) : h(v) {}
+    ScopedIcmp(const ScopedIcmp&) = delete;
+    ScopedIcmp& operator=(const ScopedIcmp&) = delete;
+    ~ScopedIcmp() { if (h != INVALID_HANDLE_VALUE) IcmpCloseHandle(h); }
+};
+
+static void TrimWorkingSet()
+{
+    // Long-lived background process about to idle for minutes: hand unneeded
+    // pages back to the OS (they page back in on demand).
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
+
 // ---------------------------------------------------------------- probes
 
 enum class Net { Online, Degraded, Portal, Offline };
@@ -271,50 +351,64 @@ struct ProbeResult {
     bool gotResponse = false; // some HTTP response arrived (portal suspect)
 };
 
+// One WinHTTP session for the whole process — proxy discovery and session
+// setup are not redone for every probe. The OS reclaims it at exit.
+static HINTERNET HttpSession()
+{
+    static HINTERNET ses = nullptr;
+    static bool warned = false;
+    if (!ses) {
+        ses = WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!ses)
+            ses = WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (ses)
+            WinHttpSetTimeouts(ses, 5000, 5000, 5000, 5000);
+        else if (!warned) {
+            warned = true;
+            Logf(L"WinHttpOpen failed (%u) — HTTP probes unavailable", GetLastError());
+        }
+    }
+    return ses;
+}
+
 static ProbeResult HttpProbe(const wchar_t* host, const wchar_t* path,
                              bool expect204, const char* expectBody)
 {
     ProbeResult r;
-    HINTERNET ses = WinHttpOpen(L"NetVigil/1.0",
-                                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses)
-        ses = WinHttpOpen(L"NetVigil/1.0",
-                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET ses = HttpSession();
     if (!ses) return r;
-    WinHttpSetTimeouts(ses, 5000, 5000, 5000, 5000);
 
-    HINTERNET con = WinHttpConnect(ses, host, INTERNET_DEFAULT_HTTP_PORT, 0);
-    HINTERNET req = con ? WinHttpOpenRequest(con, L"GET", path, nullptr,
-                                             WINHTTP_NO_REFERER,
-                                             WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
-                        : nullptr;
-    if (req) {
-        DWORD disable = WINHTTP_DISABLE_REDIRECTS; // a portal 302 must not pass
-        WinHttpSetOption(req, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof disable);
-        if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-            WinHttpReceiveResponse(req, nullptr)) {
-            r.gotResponse = true;
-            DWORD status = 0, len = sizeof status;
-            WinHttpQueryHeaders(req,
-                                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &len,
-                                WINHTTP_NO_HEADER_INDEX);
-            if (expect204) {
-                r.ok = (status == 204);
-            } else if (status == 200 && expectBody) {
-                char body[64] = {};
-                DWORD rd = 0;
-                WinHttpReadData(req, body, sizeof body - 1, &rd);
-                r.ok = strncmp(body, expectBody, strlen(expectBody)) == 0;
-            }
-        }
+    ScopedWinHttp con(WinHttpConnect(ses, host, INTERNET_DEFAULT_HTTP_PORT, 0));
+    if (!con.h) return r;
+    ScopedWinHttp req(WinHttpOpenRequest(con.h, L"GET", path, nullptr,
+                                         WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES, 0));
+    if (!req.h) return r;
+
+    DWORD disable = WINHTTP_DISABLE_REDIRECTS; // a portal 302 must not pass
+    WinHttpSetOption(req.h, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof disable);
+    if (!WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(req.h, nullptr))
+        return r;
+
+    r.gotResponse = true;
+    DWORD status = 0, len = sizeof status;
+    if (!WinHttpQueryHeaders(req.h,
+                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &len,
+                             WINHTTP_NO_HEADER_INDEX))
+        return r;
+    if (expect204) {
+        r.ok = (status == 204);
+    } else if (status == 200 && expectBody) {
+        char body[64] = {};
+        DWORD rd = 0;
+        if (WinHttpReadData(req.h, body, sizeof body - 1, &rd))
+            r.ok = strncmp(body, expectBody, strlen(expectBody)) == 0;
     }
-    if (req) WinHttpCloseHandle(req);
-    if (con) WinHttpCloseHandle(con);
-    WinHttpCloseHandle(ses);
     return r;
 }
 
@@ -322,13 +416,12 @@ static bool PingProbe(const char* ipStr)
 {
     IN_ADDR addr{};
     if (InetPtonA(AF_INET, ipStr, &addr) != 1) return false;
-    HANDLE h = IcmpCreateFile();
-    if (h == INVALID_HANDLE_VALUE) return false;
+    ScopedIcmp icmp(IcmpCreateFile());
+    if (icmp.h == INVALID_HANDLE_VALUE) return false;
     char payload[32] = "NetVigil-probe";
     BYTE reply[sizeof(ICMP_ECHO_REPLY) + sizeof payload + 8] = {};
-    DWORD n = IcmpSendEcho(h, addr.S_un.S_addr, payload, sizeof payload,
+    DWORD n = IcmpSendEcho(icmp.h, addr.S_un.S_addr, payload, sizeof payload,
                            nullptr, reply, sizeof reply, 3000);
-    IcmpCloseHandle(h);
     if (n == 0) return false;
     return ((PICMP_ECHO_REPLY)reply)->Status == IP_SUCCESS;
 }
@@ -383,16 +476,22 @@ static std::vector<WlanIfaceInfo> EnumWlanIfaces(HANDLE h)
 {
     std::vector<WlanIfaceInfo> out;
     PWLAN_INTERFACE_INFO_LIST list = nullptr;
-    if (WlanEnumInterfaces(h, nullptr, &list) == ERROR_SUCCESS && list) {
-        for (DWORD i = 0; i < list->dwNumberOfItems; ++i) {
-            const WLAN_INTERFACE_INFO& it = list->InterfaceInfo[i];
-            WlanIfaceInfo inf;
-            inf.guid  = it.InterfaceGuid;
-            inf.desc  = it.strInterfaceDescription;
-            inf.state = it.isState;
-            out.push_back(std::move(inf));
-        }
-        WlanFreeMemory(list);
+    DWORD rc = WlanEnumInterfaces(h, nullptr, &list);
+    if (rc != ERROR_SUCCESS || !list) {
+        if (rc != ERROR_SUCCESS)
+            Logf(L"WlanEnumInterfaces failed (%u)", rc);
+        return out;
+    }
+    ScopedWlanMem mem;
+    mem.p = list;
+    out.reserve(list->dwNumberOfItems);
+    for (DWORD i = 0; i < list->dwNumberOfItems; ++i) {
+        const WLAN_INTERFACE_INFO& it = list->InterfaceInfo[i];
+        WlanIfaceInfo inf;
+        inf.guid  = it.InterfaceGuid;
+        inf.desc  = it.strInterfaceDescription;
+        inf.state = it.isState;
+        out.push_back(std::move(inf));
     }
     return out;
 }
@@ -400,31 +499,30 @@ static std::vector<WlanIfaceInfo> EnumWlanIfaces(HANDLE h)
 static WLAN_INTERFACE_STATE GetIfaceState(HANDLE h, const GUID& g)
 {
     WLAN_INTERFACE_STATE st = wlan_interface_state_not_ready;
-    PVOID data = nullptr;
+    ScopedWlanMem mem;
     DWORD sz = 0;
     WLAN_OPCODE_VALUE_TYPE t;
     if (WlanQueryInterface(h, &g, wlan_intf_opcode_interface_state, nullptr,
-                           &sz, &data, &t) == ERROR_SUCCESS && data) {
-        st = *(WLAN_INTERFACE_STATE*)data;
-        WlanFreeMemory(data);
-    }
+                           &sz, &mem.p, &t) == ERROR_SUCCESS &&
+        mem.p && sz >= sizeof(WLAN_INTERFACE_STATE))
+        st = *mem.as<WLAN_INTERFACE_STATE>();
     return st;
 }
 
 static std::wstring GetConnectedSsid(HANDLE h, const GUID& g)
 {
     std::wstring ssid;
-    PVOID data = nullptr;
+    ScopedWlanMem mem;
     DWORD sz = 0;
     WLAN_OPCODE_VALUE_TYPE t;
     if (WlanQueryInterface(h, &g, wlan_intf_opcode_current_connection, nullptr,
-                           &sz, &data, &t) == ERROR_SUCCESS && data) {
-        const WLAN_CONNECTION_ATTRIBUTES* attr = (const WLAN_CONNECTION_ATTRIBUTES*)data;
+                           &sz, &mem.p, &t) == ERROR_SUCCESS &&
+        mem.p && sz >= sizeof(WLAN_CONNECTION_ATTRIBUTES)) {
+        const WLAN_CONNECTION_ATTRIBUTES* attr = mem.as<WLAN_CONNECTION_ATTRIBUTES>();
         const DOT11_SSID& s = attr->wlanAssociationAttributes.dot11Ssid;
         std::string raw((const char*)s.ucSSID,
                         s.uSSIDLength <= DOT11_SSID_MAX_LENGTH ? s.uSSIDLength : 0);
         ssid = Utf8ToWide(raw);
-        WlanFreeMemory(data);
     }
     return ssid;
 }
@@ -433,13 +531,14 @@ static std::wstring GetConnectedSsid(HANDLE h, const GUID& g)
 static bool EnsureRadioOn(HANDLE h, const GUID& g)
 {
     bool flipped = false;
-    PVOID data = nullptr;
+    ScopedWlanMem mem;
     DWORD sz = 0;
     WLAN_OPCODE_VALUE_TYPE t;
     if (WlanQueryInterface(h, &g, wlan_intf_opcode_radio_state, nullptr,
-                           &sz, &data, &t) != ERROR_SUCCESS || !data)
+                           &sz, &mem.p, &t) != ERROR_SUCCESS ||
+        !mem.p || sz < sizeof(WLAN_RADIO_STATE))
         return false;
-    WLAN_RADIO_STATE* rs = (WLAN_RADIO_STATE*)data;
+    WLAN_RADIO_STATE* rs = mem.as<WLAN_RADIO_STATE>();
     for (DWORD i = 0; i < rs->dwNumberOfPhys && i < WLAN_MAX_PHY_INDEX; ++i) {
         const WLAN_PHY_RADIO_STATE& phy = rs->PhyRadioState[i];
         if (phy.dot11SoftwareRadioState == dot11_radio_state_off) {
@@ -455,7 +554,6 @@ static bool EnsureRadioOn(HANDLE h, const GUID& g)
             Logf(L"  WARNING: hardware radio/airplane switch is OFF (phy %u) — "
                  L"cannot be enabled from software", phy.dwPhyIndex);
     }
-    WlanFreeMemory(data);
     return flipped;
 }
 
@@ -472,6 +570,9 @@ static std::vector<Candidate> GetCandidates(HANDLE h, const GUID& g)
     if (WlanGetAvailableNetworkList(h, &g,
             WLAN_AVAILABLE_NETWORK_INCLUDE_ALL_MANUAL_HIDDEN_PROFILES,
             nullptr, &list) == ERROR_SUCCESS && list) {
+        ScopedWlanMem mem;
+        mem.p = list;
+        v.reserve(list->dwNumberOfItems);
         for (DWORD i = 0; i < list->dwNumberOfItems; ++i) {
             const WLAN_AVAILABLE_NETWORK& n = list->Network[i];
             if (!(n.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE)) continue;
@@ -496,7 +597,6 @@ static std::vector<Candidate> GetCandidates(HANDLE h, const GUID& g)
                 v.push_back(std::move(c));
             }
         }
-        WlanFreeMemory(list);
     }
     std::sort(v.begin(), v.end(),
               [](const Candidate& a, const Candidate& b) { return a.quality > b.quality; });
@@ -541,12 +641,13 @@ static bool ReconnectIface(HANDLE h, const WlanIfaceInfo& inf, bool bounceIfConn
         // profile list in preference order.
         PWLAN_PROFILE_INFO_LIST pl = nullptr;
         if (WlanGetProfileList(h, &inf.guid, nullptr, &pl) == ERROR_SUCCESS && pl) {
+            ScopedWlanMem mem;
+            mem.p = pl;
             for (DWORD i = 0; i < pl->dwNumberOfItems && i < 5; ++i) {
                 Candidate c;
                 c.profile = pl->ProfileInfo[i].strProfileName;
                 cands.push_back(std::move(c));
             }
-            WlanFreeMemory(pl);
         }
     }
     if (cands.empty()) {
@@ -607,24 +708,23 @@ static bool StartOrRestartWlanSvc(bool forceRestart); // fwd
 // ended up associated.
 static bool WifiReconnectAll(bool bounceIfConnected)
 {
-    HANDLE h = OpenWlan();
-    if (!h && g_elevated) {
+    ScopedWlan wl(OpenWlan());
+    if (!wl.h && g_elevated) {
         Logf(L"WlanOpenHandle failed — making sure WlanSvc is running");
         StartOrRestartWlanSvc(false);
         Sleep(3000);
-        h = OpenWlan();
+        wl.reset(OpenWlan());
     }
-    if (!h) {
+    if (!wl.h) {
         Logf(L"cannot talk to WLAN service (WlanOpenHandle failed)");
         return false;
     }
-    std::vector<WlanIfaceInfo> ifs = EnumWlanIfaces(h);
+    std::vector<WlanIfaceInfo> ifs = EnumWlanIfaces(wl.h);
     if (ifs.empty())
         Logf(L"no WLAN interfaces present (adapter unplugged, disabled, or driver wedged)");
     bool any = false;
     for (const auto& i : ifs)
-        any = ReconnectIface(h, i, bounceIfConnected) || any;
-    WlanCloseHandle(h, nullptr);
+        any = ReconnectIface(wl.h, i, bounceIfConnected) || any;
     return any;
 }
 
@@ -633,14 +733,13 @@ static bool WifiReconnectAll(bool bounceIfConnected)
 static std::vector<std::wstring> CurrentWlanAdapterIds()
 {
     std::vector<std::wstring> ids;
-    HANDLE h = OpenWlan();
-    if (!h) return ids;
-    for (const auto& i : EnumWlanIfaces(h)) {
+    ScopedWlan wl(OpenWlan());
+    if (!wl.h) return ids;
+    for (const auto& i : EnumWlanIfaces(wl.h)) {
         if (Lower(i.desc).find(L"virtual") != std::wstring::npos) continue;
         wchar_t g[64] = {};
         if (StringFromGUID2(i.guid, g, 64) > 0) ids.push_back(g);
     }
-    WlanCloseHandle(h, nullptr);
     return ids;
 }
 
@@ -659,14 +758,14 @@ static std::wstring DevRegString(HDEVINFO devs, SP_DEVINFO_DATA* did, DWORD prop
 static std::wstring DevNetCfgInstanceId(HDEVINFO devs, SP_DEVINFO_DATA* did)
 {
     std::wstring id;
-    HKEY hk = SetupDiOpenDevRegKey(devs, did, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_READ);
-    if (hk != INVALID_HANDLE_VALUE) {
+    ScopedRegKey key(SetupDiOpenDevRegKey(devs, did, DICS_FLAG_GLOBAL, 0,
+                                          DIREG_DRV, KEY_READ));
+    if (key.k != (HKEY)INVALID_HANDLE_VALUE) {
         wchar_t buf[64] = {};
         DWORD sz = sizeof buf - sizeof(wchar_t), type = 0;
-        if (RegQueryValueExW(hk, L"NetCfgInstanceId", nullptr, &type,
+        if (RegQueryValueExW(key.k, L"NetCfgInstanceId", nullptr, &type,
                              (PBYTE)buf, &sz) == ERROR_SUCCESS && type == REG_SZ)
             id = buf;
-        RegCloseKey(hk);
     }
     return id;
 }
@@ -703,8 +802,9 @@ static bool LooksWireless(const std::wstring& descLower)
 static int ResetWifiAdapters(const std::vector<std::wstring>& targetIds)
 {
     int resetCount = 0;
-    HDEVINFO devs = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr,
-                                         DIGCF_PRESENT);
+    ScopedDevInfo devInfo(SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr,
+                                               DIGCF_PRESENT));
+    HDEVINFO devs = devInfo.h;
     if (devs == INVALID_HANDLE_VALUE) {
         Logf(L"SetupDiGetClassDevs failed (%u)", GetLastError());
         return 0;
@@ -742,7 +842,6 @@ static int ResetWifiAdapters(const std::vector<std::wstring>& targetIds)
         }
         ++resetCount;
     }
-    SetupDiDestroyDeviceInfoList(devs);
     if (resetCount) {
         Logf(L"%d adapter(s) reset — waiting for driver re-init", resetCount);
         WaitStop(8000);
@@ -754,16 +853,16 @@ static int ResetWifiAdapters(const std::vector<std::wstring>& targetIds)
 
 static bool StartOrRestartWlanSvc(bool forceRestart)
 {
-    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm) {
+    ScopedSvc scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm.h) {
         Logf(L"OpenSCManager failed (%u)", GetLastError());
         return false;
     }
-    SC_HANDLE svc = OpenServiceW(scm, L"WlanSvc",
-                                 SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS);
+    ScopedSvc svcGuard(OpenServiceW(scm.h, L"WlanSvc",
+                                    SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS));
+    SC_HANDLE svc = svcGuard.h;
     if (!svc) {
         Logf(L"OpenService(WlanSvc) failed (%u)", GetLastError());
-        CloseServiceHandle(scm);
         return false;
     }
 
@@ -802,8 +901,6 @@ static bool StartOrRestartWlanSvc(bool forceRestart)
         ok = ok && ss.dwCurrentState == SERVICE_RUNNING;
     }
 
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
     Logf(L"WlanSvc %ls %ls", forceRestart ? L"restart" : L"start-check",
          ok ? L"ok" : L"FAILED");
     return ok;
@@ -875,6 +972,7 @@ static Net Remediate(Net current, ULONGLONG& lastResetTick)
 // Returns true if stop was requested.
 static bool IntervalWait(DWORD minutes)
 {
+    TrimWorkingSet();
     ULONGLONG w0 = WallMs(), u0 = UnbiasedMs();
     ULONGLONG total = (ULONGLONG)minutes * 60000ull, slept = 0;
     while (slept < total) {
@@ -893,9 +991,9 @@ static bool IntervalWait(DWORD minutes)
 static int RunMonitor(DWORD intervalMin)
 {
     SECURITY_ATTRIBUTES* sa = NamedObjSa();
-    HANDLE mutex = CreateMutexW(sa, FALSE, kMutexName);
+    ScopedHandle mutex(CreateMutexW(sa, FALSE, kMutexName));
     DWORD mutexErr = GetLastError();
-    if (!mutex) {
+    if (!mutex.valid()) {
         // NULL + ACCESS_DENIED means the mutex exists but was created by a
         // differently-privileged instance — that still counts as "already
         // running". Any other failure: refuse to run unguarded.
@@ -907,9 +1005,11 @@ static int RunMonitor(DWORD intervalMin)
     }
     if (mutexErr == ERROR_ALREADY_EXISTS) {
         Logf(L"another NetVigil instance is already running — exiting");
-        CloseHandle(mutex);
         return 1;
     }
+
+    // A watchdog should never compete with foreground work for the CPU.
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 
     g_stopEvent = CreateEventW(sa, TRUE, FALSE, kStopEventName);
     DWORD evErr = GetLastError();
@@ -978,8 +1078,11 @@ static int RunMonitor(DWORD intervalMin)
     }
 
     Logf(L"stop requested — NetVigil exiting");
-    if (g_stopEvent) CloseHandle(g_stopEvent);
-    if (mutex) CloseHandle(mutex);
+    if (g_stopEvent) {
+        HANDLE ev = g_stopEvent;
+        g_stopEvent = nullptr; // CtrlHandler must not touch a closed handle
+        CloseHandle(ev);
+    }
     return 0;
 }
 
@@ -989,28 +1092,29 @@ static DWORD RunProcess(const std::wstring& cmdLine, bool quiet)
 {
     STARTUPINFOW si{};
     si.cb = sizeof si;
-    HANDLE nul = INVALID_HANDLE_VALUE;
+    ScopedHandle nul;
     if (quiet) {
         SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
-        nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa,
-                          OPEN_EXISTING, 0, nullptr);
+        nul.reset(CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa,
+                              OPEN_EXISTING, 0, nullptr));
         si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = nul;
-        si.hStdError  = nul;
+        si.hStdOutput = nul.h;
+        si.hStdError  = nul.h;
         si.hStdInput  = nullptr;
     }
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> buf(cmdLine.begin(), cmdLine.end());
     buf.push_back(L'\0');
-    DWORD code = (DWORD)-1;
-    if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, 0,
-                       nullptr, nullptr, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 60000); // bounded
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, 0,
+                        nullptr, nullptr, &si, &pi)) {
+        Logf(L"CreateProcess failed (%u): %ls", GetLastError(), cmdLine.c_str());
+        return (DWORD)-1;
     }
-    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    ScopedHandle proc(pi.hProcess), thread(pi.hThread);
+    if (WaitForSingleObject(proc.h, 60000) == WAIT_TIMEOUT) // bounded
+        Logf(L"child process still running after 60 s: %ls", cmdLine.c_str());
+    DWORD code = (DWORD)-1;
+    GetExitCodeProcess(proc.h, &code);
     return code;
 }
 
@@ -1066,12 +1170,22 @@ static bool RelaunchElevated(const wchar_t* args)
     sei.lpFile = exe.c_str();
     sei.lpParameters = args;
     sei.nShow  = SW_SHOWNORMAL;
-    if (!ShellExecuteExW(&sei)) return false;
-    if (sei.hProcess) {
-        WaitForSingleObject(sei.hProcess, 120000);
-        CloseHandle(sei.hProcess);
+    if (!ShellExecuteExW(&sei)) {
+        Logf(L"elevation request failed (%u)", GetLastError());
+        return false;
     }
-    return true;
+    DWORD code = 0;
+    if (sei.hProcess) {
+        ScopedHandle proc(sei.hProcess);
+        if (WaitForSingleObject(proc.h, 120000) == WAIT_TIMEOUT) {
+            Logf(L"elevated helper still running after 120 s — see the log for its outcome");
+            return true;
+        }
+        GetExitCodeProcess(proc.h, &code);
+    }
+    if (code != 0)
+        Logf(L"elevated helper finished with exit code %u", code);
+    return code == 0;
 }
 
 static int CmdInstall(DWORD intervalMin)
@@ -1080,7 +1194,9 @@ static int CmdInstall(DWORD intervalMin)
         Logf(L"elevation required to register the startup task — requesting UAC...");
         std::wstring args = L"--install --interval " + std::to_wstring(intervalMin);
         if (!RelaunchElevated(args.c_str())) {
-            Logf(L"elevation was declined — run --install from an elevated terminal");
+            Logf(L"elevation was declined or the helper failed — "
+                 L"run --install from an elevated terminal (see %ls)",
+                 g_logPath.c_str());
             return 1;
         }
         Logf(L"done (details in %ls)", g_logPath.c_str());
@@ -1138,16 +1254,23 @@ static int CmdUninstall()
     if (!g_elevated) {
         Logf(L"elevation required to remove the startup task — requesting UAC...");
         if (!RelaunchElevated(L"--uninstall")) {
-            Logf(L"elevation was declined — run --uninstall from an elevated terminal");
+            Logf(L"elevation was declined or the helper failed — "
+                 L"run --uninstall from an elevated terminal (see %ls)",
+                 g_logPath.c_str());
             return 1;
         }
         return 0;
     }
     SignalRunningInstance();
     WaitInstanceExit(30000);
-    std::wstring cmd = L"\"" + Sys32(L"schtasks.exe") + L"\" /Delete /F /TN " + kTaskName;
-    DWORD rc = RunProcess(cmd, false);
-    Logf(rc == 0 ? L"startup task removed" : L"schtasks /Delete failed (exit %u)", rc);
+    DWORD rc = 0;
+    if (!TaskInstalled()) {
+        Logf(L"startup task was not installed — nothing to remove");
+    } else {
+        std::wstring cmd = L"\"" + Sys32(L"schtasks.exe") + L"\" /Delete /F /TN " + kTaskName;
+        rc = RunProcess(cmd, false);
+        Logf(rc == 0 ? L"startup task removed" : L"schtasks /Delete failed (exit %u)", rc);
+    }
 
     // Remove the installed copy (never the exe the user launched from
     // elsewhere). If we ARE that copy, it cannot delete itself — defer.
@@ -1197,21 +1320,20 @@ static int CmdStatus()
     Logf(L"  log:       %ls", g_logPath.c_str());
     Logf(L"  task:      %ls", TaskInstalled() ? L"installed" : L"not installed");
 
-    HANDLE h = OpenWlan();
-    if (!h) {
+    ScopedWlan wl(OpenWlan());
+    if (!wl.h) {
         Logf(L"  WLAN:      unavailable (WlanSvc not running?)");
     } else {
-        std::vector<WlanIfaceInfo> ifs = EnumWlanIfaces(h);
+        std::vector<WlanIfaceInfo> ifs = EnumWlanIfaces(wl.h);
         if (ifs.empty()) Logf(L"  WLAN:      no interfaces");
         for (size_t i = 0; i < ifs.size(); ++i) {
-            WLAN_INTERFACE_STATE st = GetIfaceState(h, ifs[i].guid);
+            WLAN_INTERFACE_STATE st = GetIfaceState(wl.h, ifs[i].guid);
             std::wstring extra;
             if (st == wlan_interface_state_connected)
-                extra = L" (SSID '" + GetConnectedSsid(h, ifs[i].guid) + L"')";
+                extra = L" (SSID '" + GetConnectedSsid(wl.h, ifs[i].guid) + L"')";
             Logf(L"  WLAN[%zu]:   %ls — %ls%ls", i, ifs[i].desc.c_str(),
                  IfStateStr(st), extra.c_str());
         }
-        WlanCloseHandle(h, nullptr);
     }
 
     ProbeResult a = HttpProbe(L"www.msftconnecttest.com", L"/connecttest.txt",
@@ -1271,16 +1393,33 @@ static BOOL WINAPI CtrlHandler(DWORD)
     return FALSE;
 }
 
+// Last-gasp logging so a crash of the long-running monitor is visible in the
+// log instead of the process just vanishing.
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
+{
+    Logf(L"FATAL: unhandled exception 0x%08X at %p — exiting",
+         ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
+         ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static bool g_wsaOk = false;
+
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 {
+    HeapSetInformation(nullptr, HeapEnableTerminationOnCorruption, nullptr, 0);
     BindConsole();
+    InitLog();
+    SetUnhandledExceptionFilter(CrashFilter);
 
     WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    int wsaRc = WSAStartup(MAKEWORD(2, 2), &wsa);
+    g_wsaOk = (wsaRc == 0);
+    if (!g_wsaOk)
+        Logf(L"WSAStartup failed (%d) — continuing; probes are unaffected", wsaRc);
     g_queryUnbiased = (PfnQueryUnbiased)GetProcAddress(
         GetModuleHandleW(L"kernel32.dll"), "QueryUnbiasedInterruptTime");
     g_elevated = IsElevated();
-    InitLog();
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
     int argc = 0;
@@ -1306,7 +1445,7 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
         } else {
             Logf(L"unknown argument: %ls (see --help)", argv[i]);
             LocalFree(argv);
-            WSACleanup();
+            if (g_wsaOk) WSACleanup();
             return 2;
         }
     }
@@ -1323,6 +1462,6 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     default:              rc = RunMonitor(interval); break;
     }
 
-    WSACleanup();
+    if (g_wsaOk) WSACleanup();
     return rc;
 }
