@@ -10,11 +10,8 @@
 // adapter has wedged so hard it vanished from WlanSvc, a heuristic pass
 // resets present wireless-looking net devices instead.
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <winsock2.h>
+#include "core.h"
 #include <ws2tcpip.h>
-#include <windows.h>
 #include <objbase.h>
 #include <initguid.h>
 #include <devguid.h>
@@ -30,8 +27,11 @@
 #include <cstdarg>
 #include <cstring>
 #include <cwctype>
+#include <ctime>
 #include <string>
 #include <vector>
+#include <map>
+#include <deque>
 #include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -58,8 +58,27 @@ static const ULONGLONG kLogRotateBytes     = 1ull << 20;        // 1 MiB
 // ---------------------------------------------------------------- globals
 
 static std::wstring g_logPath;
+static std::wstring g_iniPath;
 static bool         g_elevated  = false;
-static HANDLE       g_stopEvent = nullptr;
+static HANDLE       g_stopEvent = nullptr;   // manual-reset, named: "exit"
+static HANDLE       g_wakeEvent = nullptr;   // auto-reset: "check now"
+
+static CRITICAL_SECTION g_logCs, g_stateCs, g_cfgCs;
+static std::deque<std::wstring> g_logRing;   // tail shown in the GUI
+static unsigned long long g_logSeq = 0;      // lines ever logged
+static const size_t kLogRingMax = 400;
+
+static MonitorState g_state;
+static volatile LONG g_paused      = 0;
+static volatile LONG g_intervalMin = (LONG)kDefaultIntervalMin;
+static volatile LONG g_notify      = 1;
+static HWND g_uiHwnd = nullptr;
+static UINT g_uiMsg  = 0;
+
+static void NotifyUi(UiEvent ev, LPARAM lp = 0)
+{
+    if (g_uiHwnd) PostMessageW(g_uiHwnd, g_uiMsg, ev, lp);
+}
 
 // ---------------------------------------------------------------- utilities
 
@@ -116,19 +135,8 @@ static std::wstring Sys32(const wchar_t* exe)
     return std::wstring(s) + L"\\" + exe;
 }
 
-static void LogLine(const std::wstring& msg)
+static void AppendLogFile(const std::string& bytes)
 {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t stamp[40];
-    swprintf_s(stamp, L"%04u-%02u-%02u %02u:%02u:%02u  ",
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-    std::string console = WideToUtf8(std::wstring(stamp) + msg + L"\n");
-    fputs(console.c_str(), stdout);
-    fflush(stdout);
-
-    if (g_logPath.empty()) return;
     HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA,
                            FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -143,13 +151,35 @@ static void LogLine(const std::wstring& msg)
                         FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) return;
     }
-    std::string line = WideToUtf8(std::wstring(stamp) + msg + L"\r\n");
     DWORD written = 0;
-    WriteFile(h, line.data(), (DWORD)line.size(), &written, nullptr);
+    WriteFile(h, bytes.data(), (DWORD)bytes.size(), &written, nullptr);
     CloseHandle(h);
 }
 
-static void Logf(const wchar_t* fmt, ...)
+// Called from both the worker and the UI thread.
+static void LogLine(const std::wstring& msg)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t stamp[40];
+    swprintf_s(stamp, L"%04u-%02u-%02u %02u:%02u:%02u  ",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::wstring line = std::wstring(stamp) + msg;
+    std::string console = WideToUtf8(line + L"\n");
+
+    EnterCriticalSection(&g_logCs);
+    fputs(console.c_str(), stdout);
+    fflush(stdout);
+    g_logRing.push_back(line);
+    if (g_logRing.size() > kLogRingMax) g_logRing.pop_front();
+    ++g_logSeq;
+    if (!g_logPath.empty()) AppendLogFile(WideToUtf8(line + L"\r\n"));
+    LeaveCriticalSection(&g_logCs);
+
+    NotifyUi(UiLogAppended);
+}
+
+void Logf(const wchar_t* fmt, ...)
 {
     wchar_t buf[2048];
     va_list ap;
@@ -157,6 +187,29 @@ static void Logf(const wchar_t* fmt, ...)
     _vsnwprintf_s(buf, _TRUNCATE, fmt, ap);
     va_end(ap);
     LogLine(buf);
+}
+
+std::vector<std::wstring> GetLogSince(unsigned long long& seq)
+{
+    std::vector<std::wstring> out;
+    EnterCriticalSection(&g_logCs);
+    unsigned long long oldest = g_logSeq - g_logRing.size(); // seq of ring[0]
+    unsigned long long from = seq < oldest ? oldest : seq;
+    for (unsigned long long i = from; i < g_logSeq; ++i)
+        out.push_back(g_logRing[(size_t)(i - oldest)]);
+    seq = g_logSeq;
+    LeaveCriticalSection(&g_logCs);
+    return out;
+}
+
+const std::wstring& LogPath() { return g_logPath; }
+
+static void InitCore()
+{
+    InitializeCriticalSection(&g_logCs);
+    InitializeCriticalSection(&g_stateCs);
+    InitializeCriticalSection(&g_cfgCs);
+    g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
 
 static void InitLog()
@@ -167,6 +220,7 @@ static void InitLog()
                                                : ExeDir();
     CreateDirectoryW(dir.c_str(), nullptr);
     g_logPath = dir + L"\\netvigil.log";
+    g_iniPath = dir + L"\\netvigil.ini";
 }
 
 // Attach to the parent console (when launched from a terminal) so command
@@ -332,11 +386,243 @@ static void TrimWorkingSet()
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
 
+// ---------------------------------------------------------------- monitor state
+
+template <typename F>
+static void UpdateState(F fn)
+{
+    EnterCriticalSection(&g_stateCs);
+    fn(g_state);
+    LeaveCriticalSection(&g_stateCs);
+    NotifyUi(UiStateChanged);
+}
+
+MonitorState GetMonitorState()
+{
+    EnterCriticalSection(&g_stateCs);
+    MonitorState s = g_state;
+    LeaveCriticalSection(&g_stateCs);
+    return s;
+}
+
+void SetUiNotify(HWND hwnd, UINT msg)
+{
+    g_uiHwnd = hwnd;
+    g_uiMsg  = msg;
+}
+
+void RequestCheckNow()
+{
+    if (g_wakeEvent) SetEvent(g_wakeEvent);
+}
+
+void SetPaused(bool paused)
+{
+    InterlockedExchange(&g_paused, paused ? 1 : 0);
+    UpdateState([&](MonitorState& s) { s.paused = paused; });
+    Logf(paused ? L"monitoring paused" : L"monitoring resumed");
+    RequestCheckNow(); // wake the worker so it notices either way
+}
+
+void RequestStop()
+{
+    if (g_stopEvent) SetEvent(g_stopEvent);
+    UpdateState([](MonitorState& s) { s.stopping = true; });
+}
+
+// ---------------------------------------------------------------- config (ini)
+//
+// %LOCALAPPDATA%\NetVigil\netvigil.ini
+//   [settings]  interval=10  notifications=1
+//   [networks]  <profile>=preferred|never        (absent = allowed)
+//   [seen]      <profile>=<unix-time>|<connects>|<ssid>
+
+struct SeenInfo {
+    long long lastSeen = 0;
+    int connects = 0;
+    std::wstring ssid;
+};
+static std::map<std::wstring, NetMode>  g_modes;
+static std::map<std::wstring, SeenInfo> g_seen;
+static std::wstring g_lastRecordedProfile;
+
+static const wchar_t* ModeStr(NetMode m)
+{
+    switch (m) {
+    case NetMode::Preferred: return L"preferred";
+    case NetMode::Never:     return L"never";
+    default:                 return L"allowed";
+    }
+}
+
+static NetMode ParseMode(const std::wstring& s)
+{
+    std::wstring l = Lower(s);
+    if (l == L"preferred") return NetMode::Preferred;
+    if (l == L"never")     return NetMode::Never;
+    return NetMode::Allowed;
+}
+
+// INI keys cannot carry these characters; such profile names are simply not
+// persisted (they still work for connecting).
+static bool IniSafeKey(const std::wstring& k)
+{
+    return !k.empty() && k.find_first_of(L"=[]\r\n") == std::wstring::npos;
+}
+
+// WritePrivateProfileStringW only preserves non-ASCII (SSIDs!) in a file that
+// is already UTF-16LE — create it with a BOM before first use.
+static void EnsureUnicodeIni()
+{
+    if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    ScopedHandle f(CreateFileW(g_iniPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!f.valid()) return;
+    const BYTE bom[] = { 0xFF, 0xFE, '\r', 0, '\n', 0 };
+    DWORD w = 0;
+    WriteFile(f.h, bom, sizeof bom, &w, nullptr);
+}
+
+static std::vector<std::pair<std::wstring, std::wstring>> ReadIniSection(const wchar_t* section)
+{
+    std::vector<std::pair<std::wstring, std::wstring>> out;
+    std::vector<wchar_t> buf(32768);
+    DWORD n = GetPrivateProfileSectionW(section, buf.data(), (DWORD)buf.size(),
+                                        g_iniPath.c_str());
+    if (n == 0) return out;
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+        const wchar_t* eq = wcschr(p, L'=');
+        if (!eq) continue;
+        out.emplace_back(std::wstring(p, eq), std::wstring(eq + 1));
+    }
+    return out;
+}
+
+static void SaveSetting(const wchar_t* key, const std::wstring& value)
+{
+    WritePrivateProfileStringW(L"settings", key, value.c_str(), g_iniPath.c_str());
+}
+
+static void LoadConfig(DWORD intervalArg)
+{
+    EnsureUnicodeIni();
+    UINT iv = GetPrivateProfileIntW(L"settings", L"interval", 0, g_iniPath.c_str());
+    InterlockedExchange(&g_intervalMin, (iv >= 1 && iv <= 1440) ? (LONG)iv : (LONG)intervalArg);
+    InterlockedExchange(&g_notify,
+        GetPrivateProfileIntW(L"settings", L"notifications", 1, g_iniPath.c_str()) ? 1 : 0);
+
+    EnterCriticalSection(&g_cfgCs);
+    for (const auto& kv : ReadIniSection(L"networks"))
+        g_modes[kv.first] = ParseMode(kv.second);
+    for (const auto& kv : ReadIniSection(L"seen")) {
+        SeenInfo s;
+        const std::wstring& v = kv.second;
+        size_t p1 = v.find(L'|');
+        size_t p2 = p1 == std::wstring::npos ? p1 : v.find(L'|', p1 + 1);
+        s.lastSeen = _wtoi64(v.c_str());
+        if (p1 != std::wstring::npos) s.connects = _wtoi(v.c_str() + p1 + 1);
+        if (p2 != std::wstring::npos) s.ssid = v.substr(p2 + 1);
+        g_seen[kv.first] = s;
+    }
+    size_t modes = g_modes.size(), seen = g_seen.size();
+    LeaveCriticalSection(&g_cfgCs);
+    Logf(L"config: %zu network preference(s), %zu remembered network(s), interval %u min",
+         modes, seen, (unsigned)g_intervalMin);
+}
+
+static void SaveSeen(const std::wstring& profile, const SeenInfo& s)
+{
+    std::wstring v = std::to_wstring(s.lastSeen) + L"|" +
+                     std::to_wstring(s.connects) + L"|" + s.ssid;
+    WritePrivateProfileStringW(L"seen", profile.c_str(), v.c_str(), g_iniPath.c_str());
+}
+
+// Remember the network the machine is on. Writes only on a change of
+// network or every 30 min, so the ini is not churned every cycle.
+static void RecordConnected(const std::wstring& profile, const std::wstring& ssid)
+{
+    if (!IniSafeKey(profile)) return;
+    long long now = (long long)_time64(nullptr);
+    EnterCriticalSection(&g_cfgCs);
+    SeenInfo& s = g_seen[profile];
+    bool changed = profile != g_lastRecordedProfile;
+    if (changed) {
+        ++s.connects;
+        g_lastRecordedProfile = profile;
+    }
+    if (changed || now - s.lastSeen > 1800) {
+        s.lastSeen = now;
+        s.ssid = ssid;
+        SaveSeen(profile, s);
+    }
+    int connects = s.connects;
+    LeaveCriticalSection(&g_cfgCs);
+    if (changed)
+        Logf(L"on network '%ls' (remembered; connected %d time%ls)",
+             profile.c_str(), connects, connects == 1 ? L"" : L"s");
+}
+
+static NetMode ModeOf(const std::wstring& profile)
+{
+    EnterCriticalSection(&g_cfgCs);
+    auto it = g_modes.find(profile);
+    NetMode m = it == g_modes.end() ? NetMode::Allowed : it->second;
+    LeaveCriticalSection(&g_cfgCs);
+    return m;
+}
+
+void SetNetworkMode(const std::wstring& profile, NetMode mode)
+{
+    if (!IniSafeKey(profile)) {
+        Logf(L"cannot save a preference for '%ls' (unsupported characters in name)",
+             profile.c_str());
+        return;
+    }
+    EnterCriticalSection(&g_cfgCs);
+    if (mode == NetMode::Preferred) { // only one preferred network at a time
+        for (auto& kv : g_modes) {
+            if (kv.second == NetMode::Preferred && kv.first != profile) {
+                kv.second = NetMode::Allowed;
+                WritePrivateProfileStringW(L"networks", kv.first.c_str(), nullptr,
+                                           g_iniPath.c_str());
+            }
+        }
+    }
+    if (mode == NetMode::Allowed) {
+        g_modes.erase(profile);
+        WritePrivateProfileStringW(L"networks", profile.c_str(), nullptr, g_iniPath.c_str());
+    } else {
+        g_modes[profile] = mode;
+        WritePrivateProfileStringW(L"networks", profile.c_str(), ModeStr(mode),
+                                   g_iniPath.c_str());
+    }
+    LeaveCriticalSection(&g_cfgCs);
+    Logf(L"network '%ls' set to: %ls", profile.c_str(), ModeStr(mode));
+    NotifyUi(UiStateChanged);
+}
+
+DWORD GetIntervalMin() { return (DWORD)g_intervalMin; }
+
+void SetIntervalMin(DWORD minutes)
+{
+    if (minutes < 1) minutes = 1;
+    if (minutes > 1440) minutes = 1440;
+    InterlockedExchange(&g_intervalMin, (LONG)minutes);
+    SaveSetting(L"interval", std::to_wstring(minutes));
+    Logf(L"check interval set to %u min", minutes);
+}
+
+bool GetNotifications() { return g_notify != 0; }
+
+void SetNotifications(bool on)
+{
+    InterlockedExchange(&g_notify, on ? 1 : 0);
+    SaveSetting(L"notifications", on ? L"1" : L"0");
+}
+
 // ---------------------------------------------------------------- probes
 
-enum class Net { Online, Degraded, Portal, Offline };
-
-static const wchar_t* NetToStr(Net n)
+const wchar_t* NetToStr(Net n)
 {
     switch (n) {
     case Net::Online:   return L"ONLINE";
@@ -739,22 +1025,45 @@ static WLAN_INTERFACE_STATE GetIfaceState(HANDLE h, const GUID& g)
     return st;
 }
 
-static std::wstring GetConnectedSsid(HANDLE h, const GUID& g)
+// SSID + profile of the network an interface is currently connected to.
+static bool GetConnection(HANDLE h, const GUID& g, std::wstring& ssid, std::wstring& profile)
 {
-    std::wstring ssid;
     ScopedWlanMem mem;
     DWORD sz = 0;
     WLAN_OPCODE_VALUE_TYPE t;
     if (WlanQueryInterface(h, &g, wlan_intf_opcode_current_connection, nullptr,
-                           &sz, &mem.p, &t) == ERROR_SUCCESS &&
-        mem.p && sz >= sizeof(WLAN_CONNECTION_ATTRIBUTES)) {
-        const WLAN_CONNECTION_ATTRIBUTES* attr = mem.as<WLAN_CONNECTION_ATTRIBUTES>();
-        const DOT11_SSID& s = attr->wlanAssociationAttributes.dot11Ssid;
-        std::string raw((const char*)s.ucSSID,
-                        s.uSSIDLength <= DOT11_SSID_MAX_LENGTH ? s.uSSIDLength : 0);
-        ssid = Utf8ToWide(raw);
-    }
+                           &sz, &mem.p, &t) != ERROR_SUCCESS ||
+        !mem.p || sz < sizeof(WLAN_CONNECTION_ATTRIBUTES))
+        return false;
+    const WLAN_CONNECTION_ATTRIBUTES* attr = mem.as<WLAN_CONNECTION_ATTRIBUTES>();
+    if (attr->isState != wlan_interface_state_connected) return false;
+    const DOT11_SSID& s = attr->wlanAssociationAttributes.dot11Ssid;
+    std::string raw((const char*)s.ucSSID,
+                    s.uSSIDLength <= DOT11_SSID_MAX_LENGTH ? s.uSSIDLength : 0);
+    ssid    = Utf8ToWide(raw);
+    profile = attr->strProfileName;
+    return true;
+}
+
+static std::wstring GetConnectedSsid(HANDLE h, const GUID& g)
+{
+    std::wstring ssid, profile;
+    GetConnection(h, g, ssid, profile);
     return ssid;
+}
+
+// First connected WLAN interface: what the machine is on right now.
+static bool CurrentConnection(std::wstring& ssid, std::wstring& iface, std::wstring& profile)
+{
+    ScopedWlan wl(OpenWlan());
+    if (!wl.h) return false;
+    for (const auto& i : EnumWlanIfaces(wl.h)) {
+        if (GetConnection(wl.h, i.guid, ssid, profile)) {
+            iface = i.desc;
+            return true;
+        }
+    }
+    return false;
 }
 
 // Turn on any software-disabled radio; returns true if something was flipped.
@@ -852,6 +1161,28 @@ static std::vector<Candidate> GetCandidates(HANDLE h, const GUID& g)
     return v;
 }
 
+// Apply the user's per-network policy: drop "never" networks, put the
+// preferred one first (it still has to be in the list, i.e. in range).
+static void ApplyNetworkPreferences(std::vector<Candidate>& cands, const std::wstring& desc)
+{
+    std::vector<Candidate> kept;
+    std::vector<std::wstring> skipped;
+    for (auto& c : cands) {
+        NetMode m = ModeOf(c.profile);
+        if (m == NetMode::Never) skipped.push_back(c.profile);
+        else kept.push_back(std::move(c));
+    }
+    std::stable_partition(kept.begin(), kept.end(), [](const Candidate& c) {
+        return ModeOf(c.profile) == NetMode::Preferred;
+    });
+    cands.swap(kept);
+    for (const auto& s : skipped)
+        Logf(L"  [%ls] skipping '%ls' (marked never connect)", desc.c_str(), s.c_str());
+    if (!cands.empty() && ModeOf(cands[0].profile) == NetMode::Preferred)
+        Logf(L"  [%ls] preferred network '%ls' goes first", desc.c_str(),
+             cands[0].profile.c_str());
+}
+
 static bool WaitConnected(HANDLE h, const GUID& g, DWORD ms)
 {
     ULONGLONG end = GetTickCount64() + ms;
@@ -903,6 +1234,7 @@ static bool ReconnectIface(HANDLE h, const WlanIfaceInfo& inf, bool bounceIfConn
             }
         }
     }
+    ApplyNetworkPreferences(cands, inf.desc);
     if (cands.empty()) {
         Logf(L"  [%ls] no in-range remembered networks and no saved profiles",
              inf.desc.c_str());
@@ -994,6 +1326,103 @@ static std::vector<std::wstring> CurrentWlanAdapterIds()
         if (StringFromGUID2(i.guid, g, 64) > 0) ids.push_back(g);
     }
     return ids;
+}
+
+// Everything the GUI lists: saved profiles + remembered networks, annotated
+// with live availability (no scan is triggered — cached results only).
+std::vector<KnownNetwork> GetKnownNetworks()
+{
+    std::map<std::wstring, KnownNetwork> m;
+    EnterCriticalSection(&g_cfgCs);
+    for (const auto& kv : g_seen) {
+        KnownNetwork& k = m[kv.first];
+        k.profile  = kv.first;
+        k.ssid     = kv.second.ssid;
+        k.lastSeen = kv.second.lastSeen;
+        k.connects = kv.second.connects;
+    }
+    for (const auto& kv : g_modes) {
+        KnownNetwork& k = m[kv.first];
+        k.profile = kv.first;
+        k.mode    = kv.second;
+    }
+    LeaveCriticalSection(&g_cfgCs);
+
+    ScopedWlan wl(OpenWlan());
+    if (wl.h) {
+        for (const auto& i : EnumWlanIfaces(wl.h)) {
+            PWLAN_PROFILE_INFO_LIST pl = nullptr;
+            if (WlanGetProfileList(wl.h, &i.guid, nullptr, &pl) == ERROR_SUCCESS && pl) {
+                ScopedWlanMem mem;
+                mem.p = pl;
+                for (DWORD n = 0; n < pl->dwNumberOfItems; ++n) {
+                    KnownNetwork& k = m[pl->ProfileInfo[n].strProfileName];
+                    k.profile = pl->ProfileInfo[n].strProfileName;
+                }
+            }
+            PWLAN_AVAILABLE_NETWORK_LIST list = nullptr;
+            if (WlanGetAvailableNetworkList(wl.h, &i.guid,
+                    WLAN_AVAILABLE_NETWORK_INCLUDE_ALL_MANUAL_HIDDEN_PROFILES,
+                    nullptr, &list) == ERROR_SUCCESS && list) {
+                ScopedWlanMem mem;
+                mem.p = list;
+                for (DWORD n = 0; n < list->dwNumberOfItems; ++n) {
+                    const WLAN_AVAILABLE_NETWORK& a = list->Network[n];
+                    if (!(a.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) ||
+                        !a.strProfileName[0])
+                        continue;
+                    KnownNetwork& k = m[a.strProfileName];
+                    k.profile = a.strProfileName;
+                    k.inRange = true;
+                    if (a.wlanSignalQuality > k.signal) k.signal = a.wlanSignalQuality;
+                    if (a.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) k.connected = true;
+                    if (k.ssid.empty()) {
+                        std::string raw((const char*)a.dot11Ssid.ucSSID,
+                                        a.dot11Ssid.uSSIDLength <= DOT11_SSID_MAX_LENGTH
+                                            ? a.dot11Ssid.uSSIDLength : 0);
+                        k.ssid = Utf8ToWide(raw);
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<KnownNetwork> out;
+    out.reserve(m.size());
+    for (auto& kv : m) {
+        kv.second.mode = ModeOf(kv.first);
+        out.push_back(std::move(kv.second));
+    }
+    std::sort(out.begin(), out.end(), [](const KnownNetwork& a, const KnownNetwork& b) {
+        if (a.connected != b.connected) return a.connected;
+        bool ap = a.mode == NetMode::Preferred, bp = b.mode == NetMode::Preferred;
+        if (ap != bp) return ap;
+        if (a.inRange != b.inRange) return a.inRange;
+        if (a.inRange && a.signal != b.signal) return a.signal > b.signal;
+        return a.lastSeen > b.lastSeen;
+    });
+    return out;
+}
+
+// User-initiated connect from the GUI; asynchronous (WlanConnect returns as
+// soon as the request is accepted).
+bool ConnectToNetwork(const std::wstring& profile)
+{
+    ScopedWlan wl(OpenWlan());
+    if (!wl.h) return false;
+    for (const auto& i : EnumWlanIfaces(wl.h)) {
+        WLAN_CONNECTION_PARAMETERS p{};
+        p.wlanConnectionMode = wlan_connection_mode_profile;
+        p.strProfile   = profile.c_str();
+        p.dot11BssType = dot11_BSS_type_infrastructure;
+        DWORD rc = WlanConnect(wl.h, &i.guid, &p, nullptr);
+        if (rc == ERROR_SUCCESS) {
+            Logf(L"connect to '%ls' requested on %ls", profile.c_str(), i.desc.c_str());
+            return true;
+        }
+        Logf(L"connect to '%ls' on %ls failed (rc=%u)", profile.c_str(), i.desc.c_str(), rc);
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------- device reset
@@ -1312,74 +1741,94 @@ static Net Remediate(Net current, ULONGLONG& lastResetTick)
 
 // ---------------------------------------------------------------- monitor loop
 
-// Interval wait with stop-event and resume-from-sleep detection.
-// Returns true if stop was requested.
-static bool IntervalWait(DWORD minutes)
+// Wait until the next check: honours stop, "check now", a live interval
+// change from the GUI, and resume-from-sleep. Returns true if stop was
+// requested. `liveInterval` re-reads the configured interval each tick;
+// otherwise `minutes` is fixed (the short offline retry).
+static bool IntervalWait(DWORD minutes, bool liveInterval)
 {
     TrimWorkingSet();
+    ULONGLONG start = GetTickCount64();
     ULONGLONG w0 = WallMs(), u0 = UnbiasedMs();
-    ULONGLONG total = (ULONGLONG)minutes * 60000ull, slept = 0;
-    while (slept < total) {
-        DWORD chunk = (DWORD)((total - slept) < 15000ull ? (total - slept) : 15000ull);
-        if (WaitStop(chunk)) return true;
-        slept += chunk;
+    ULONGLONG shown = 0;
+    HANDLE evs[2] = { g_stopEvent, g_wakeEvent };
+    DWORD nEvs = g_wakeEvent ? 2 : 1;
+    for (;;) {
+        ULONGLONG total = (ULONGLONG)(liveInterval ? GetIntervalMin() : minutes) * 60000ull;
+        ULONGLONG deadline = start + total;
+        if (deadline != shown) {
+            shown = deadline;
+            UpdateState([&](MonitorState& s) { s.nextCheck = deadline; });
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return false;
+        ULONGLONG left = deadline - now;
+        DWORD chunk = (DWORD)(left < 15000ull ? left : 15000ull);
+        DWORD r = g_stopEvent ? WaitForMultipleObjects(nEvs, evs, FALSE, chunk)
+                              : (Sleep(chunk), WAIT_TIMEOUT);
+        if (r == WAIT_OBJECT_0) return true;               // stop
+        if (r == WAIT_OBJECT_0 + 1) {                      // check now / pause toggle
+            Logf(L"check requested");
+            return false;
+        }
         ULONGLONG wallD = WallMs() - w0, unbD = UnbiasedMs() - u0;
         if (wallD > unbD + 90000ull) {
             Logf(L"resume from sleep detected — checking connectivity now");
             return false;
         }
     }
-    return false;
 }
 
-static int RunMonitor(DWORD intervalMin)
+// After a check: remember the network we are on and publish the result.
+static void PublishCheck(Net n, int failStreak, ULONGLONG offlineSince)
 {
-    SECURITY_ATTRIBUTES* sa = NamedObjSa();
-    ScopedHandle mutex(CreateMutexW(sa, FALSE, kMutexName));
-    DWORD mutexErr = GetLastError();
-    if (!mutex.valid()) {
-        // NULL + ACCESS_DENIED means the mutex exists but was created by a
-        // differently-privileged instance — that still counts as "already
-        // running". Any other failure: refuse to run unguarded.
-        Logf(mutexErr == ERROR_ACCESS_DENIED
-                 ? L"another NetVigil instance is already running "
-                   L"(different elevation) — exiting"
-                 : L"single-instance mutex unavailable (%u) — exiting", mutexErr);
-        return 1;
-    }
-    if (mutexErr == ERROR_ALREADY_EXISTS) {
-        Logf(L"another NetVigil instance is already running — exiting");
-        return 1;
-    }
+    std::wstring ssid, iface, profile;
+    bool wifi = CurrentConnection(ssid, iface, profile);
+    if (wifi) RecordConnected(profile, ssid);
+    UpdateState([&](MonitorState& s) {
+        s.haveStatus   = true;
+        s.status       = n;
+        s.lastCheck    = GetTickCount64();
+        s.ssid         = wifi ? ssid : L"";
+        s.iface        = wifi ? iface : L"";
+        s.failStreak   = failStreak;
+        s.offlineSince = offlineSince;
+        s.remediating  = false;
+    });
+}
 
-    // A watchdog should never compete with foreground work for the CPU.
-    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-
-    g_stopEvent = CreateEventW(sa, TRUE, FALSE, kStopEventName);
-    DWORD evErr = GetLastError();
-    if (!g_stopEvent)
-        Logf(L"warning: stop event unavailable (%u) — --stop will not reach "
-             L"this instance", evErr);
-    else if (evErr == ERROR_ALREADY_EXISTS)
-        ResetEvent(g_stopEvent); // clear a stale signal from a previous run
-
-    Logf(L"=== NetVigil started (interval %u min, %ls) ===", intervalMin,
+// The watchdog loop. Runs on its own thread under the GUI and exits when the
+// stop event is signalled.
+DWORD WINAPI MonitorThreadProc(LPVOID)
+{
+    Logf(L"=== NetVigil started (interval %u min, %ls) ===", GetIntervalMin(),
          g_elevated ? L"elevated"
                     : L"NOT elevated — stage-2 driver reset unavailable");
+    UpdateState([](MonitorState& s) {
+        s.elevated = g_elevated;
+        s.paused   = g_paused != 0;
+    });
 
     bool firstCycle = true;
     int  failStreak = 0;
-    ULONGLONG lastReset = 0;
-    ULONGLONG lastOkLog = 0;
-    ULONGLONG offlineSince = 0;
+    ULONGLONG lastReset = 0, lastOkLog = 0, offlineSince = 0;
 
     for (;;) {
+        if (StopRequested()) break;
+        if (g_paused) {
+            HANDLE evs[2] = { g_stopEvent, g_wakeEvent };
+            if (WaitForMultipleObjects(2, evs, FALSE, INFINITE) == WAIT_OBJECT_0) break;
+            continue;
+        }
+
         Net n = CheckInternet();
+        PublishCheck(n, failStreak, offlineSince);
 
         if (n == Net::Online || n == Net::Degraded) {
             if (failStreak > 0) {
-                Logf(L"connectivity restored after %llu min offline",
-                     offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0);
+                ULONGLONG mins = offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0;
+                Logf(L"connectivity restored after %llu min offline", mins);
+                NotifyUi(UiRestored, (LPARAM)mins);
                 offlineSince = 0;
             }
             if (n == Net::Degraded) {
@@ -1392,7 +1841,8 @@ static int RunMonitor(DWORD intervalMin)
             }
             failStreak = 0;
             firstCycle = false;
-            if (IntervalWait(intervalMin)) break;
+            UpdateState([](MonitorState& s) { s.failStreak = 0; s.offlineSince = 0; });
+            if (IntervalWait(0, true)) break;
             continue;
         }
 
@@ -1402,6 +1852,10 @@ static int RunMonitor(DWORD intervalMin)
         Logf(L"%ls detected — confirming in %u s",
              n == Net::Portal ? L"captive portal" : L"connection loss",
              confirmMs / 1000);
+        UpdateState([](MonitorState& s) {
+            s.remediating = true;
+            s.lastAction  = L"confirming the loss";
+        });
         if (WaitStop(confirmMs)) break;
         firstCycle = false;
 
@@ -1409,7 +1863,8 @@ static int RunMonitor(DWORD intervalMin)
         if (n2 == Net::Online || n2 == Net::Degraded) {
             Logf(L"false alarm — back online");
             failStreak = 0;
-            if (IntervalWait(intervalMin)) break;
+            PublishCheck(n2, 0, 0);
+            if (IntervalWait(0, true)) break;
             continue;
         }
 
@@ -1420,27 +1875,96 @@ static int RunMonitor(DWORD intervalMin)
         }
         Logf(L"confirmed %ls (streak %d) — starting remediation",
              NetToStr(n2), failStreak);
+        UpdateState([&](MonitorState& s) {
+            s.status       = n2;
+            s.failStreak   = failStreak;
+            s.offlineSince = offlineSince;
+            s.remediating  = true;
+            s.lastAction   = L"repairing the connection";
+        });
         Net after = Remediate(n2, lastReset);
+        PublishCheck(after, failStreak, offlineSince);
 
         if (after == Net::Online || after == Net::Degraded) {
-            Logf(L"remediation succeeded — back online after %llu min",
-                 offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0);
+            ULONGLONG mins = offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0;
+            Logf(L"remediation succeeded — back online after %llu min", mins);
+            NotifyUi(UiRestored, (LPARAM)mins);
             offlineSince = 0;
             failStreak = 0;
-            if (IntervalWait(intervalMin)) break;
+            UpdateState([](MonitorState& s) {
+                s.failStreak = 0;
+                s.offlineSince = 0;
+                s.lastAction = L"repaired";
+            });
+            if (IntervalWait(0, true)) break;
         } else {
             Logf(L"still %ls — next attempt in %u min", NetToStr(after), kOfflineRetryMin);
-            if (IntervalWait(kOfflineRetryMin)) break;
+            NotifyUi(UiFailed, (LPARAM)failStreak);
+            UpdateState([](MonitorState& s) { s.lastAction = L"repair failed — retrying"; });
+            if (IntervalWait(kOfflineRetryMin, false)) break;
         }
     }
 
     Logf(L"stop requested — NetVigil exiting");
+    UpdateState([](MonitorState& s) { s.stopping = true; });
+    NotifyUi(UiStopped);
+    return 0;
+}
+
+static ScopedHandle g_instanceMutex; // held for the process lifetime
+
+static void EnableDpiAwareness()
+{
+    typedef BOOL(WINAPI* PfnSetCtx)(DPI_AWARENESS_CONTEXT);
+    PfnSetCtx set = (PfnSetCtx)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                              "SetProcessDpiAwarenessContext");
+    if (!set || !set(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)) SetProcessDPIAware();
+}
+
+// Monitor mode: claim the single instance (or hand off to the running one),
+// create the control events, load config and run the tray/window front end
+// with the watchdog on a worker thread.
+static int StartMonitorGui(HINSTANCE hInst, bool startHidden, DWORD intervalArg)
+{
+    SECURITY_ATTRIBUTES* sa = NamedObjSa();
+    g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
+    DWORD mutexErr = GetLastError();
+    bool running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
+    if (running) {
+        // NULL + ACCESS_DENIED means the mutex exists but was created by a
+        // differently-privileged instance — that still counts as running.
+        if (!g_instanceMutex.valid() && mutexErr != ERROR_ACCESS_DENIED) {
+            Logf(L"single-instance mutex unavailable (%u) — exiting", mutexErr);
+            return 1;
+        }
+        g_instanceMutex.reset();
+        HWND existing = startHidden ? nullptr : FindWindowW(kWndClass, nullptr);
+        if (existing && PostMessageW(existing, ShowWindowMessage(), 0, 0)) {
+            Logf(L"NetVigil is already running — opened its window");
+            return 0;
+        }
+        Logf(L"another NetVigil instance is already running — exiting");
+        return 1;
+    }
+
+    g_stopEvent = CreateEventW(sa, TRUE, FALSE, kStopEventName);
+    DWORD evErr = GetLastError();
+    if (!g_stopEvent)
+        Logf(L"warning: stop event unavailable (%u) — --stop will not reach "
+             L"this instance", evErr);
+    else if (evErr == ERROR_ALREADY_EXISTS)
+        ResetEvent(g_stopEvent); // clear a stale signal from a previous run
+
+    LoadConfig(intervalArg);
+    EnableDpiAwareness();
+    int rc = RunGui(hInst, startHidden);
+
     if (g_stopEvent) {
         HANDLE ev = g_stopEvent;
         g_stopEvent = nullptr; // CtrlHandler must not touch a closed handle
         CloseHandle(ev);
     }
-    return 0;
+    return rc;
 }
 
 // ---------------------------------------------------------------- task mgmt
@@ -1586,7 +2110,7 @@ static int CmdInstall(DWORD intervalMin)
              L"cannot be pointed at a user-writable binary)", destExe.c_str());
     }
 
-    std::wstring tr = L"\\\"" + destExe + L"\\\" --interval " +
+    std::wstring tr = L"\\\"" + destExe + L"\\\" --tray --interval " +
                       std::to_wstring(intervalMin);
     std::wstring cmd = L"\"" + Sys32(L"schtasks.exe") +
                        L"\" /Create /F /TN " + kTaskName +
@@ -1598,6 +2122,8 @@ static int CmdInstall(DWORD intervalMin)
     }
     Logf(L"startup task '%ls' installed (runs at logon, elevated, interval %u min)",
          kTaskName, intervalMin);
+    EnsureUnicodeIni();
+    SaveSetting(L"interval", std::to_wstring(intervalMin));
 
     // Start it now so no re-logon is needed.
     std::wstring runCmd = L"\"" + Sys32(L"schtasks.exe") + L"\" /Run /TN " + kTaskName;
@@ -1728,17 +2254,19 @@ static void PrintHelp()
     fputs(
         "NetVigil - Wi-Fi connectivity watchdog\n"
         "\n"
-        "  NetVigil.exe                 run the monitor loop (default 10 min interval)\n"
-        "  NetVigil.exe --interval N    monitor with an N-minute check interval\n"
+        "  NetVigil.exe                 open the window (starts the watchdog if needed)\n"
+        "  NetVigil.exe --tray          start hidden in the tray (what the logon task runs)\n"
+        "  NetVigil.exe --interval N    check every N minutes (persisted in netvigil.ini)\n"
         "  NetVigil.exe --install       register + start the logon task (elevates)\n"
         "  NetVigil.exe --uninstall     stop the monitor and remove the task\n"
         "  NetVigil.exe --stop          signal a running monitor to exit\n"
         "  NetVigil.exe --status        show adapters, probes, task and verdict\n"
         "  NetVigil.exe --once          one check; remediate if offline; exit\n"
         "\n"
-        "Escalation on confirmed loss: rejoin Wi-Fi -> disable/enable the Wi-Fi\n"
-        "adapter driver -> restart WlanSvc -> reconnect. Driver reset needs the\n"
-        "elevated task (or an elevated shell) and is rate-limited to once per 15 min.\n",
+        "Closing the window keeps NetVigil running in the tray; exit from the tray\n"
+        "menu. Escalation on confirmed loss: DHCP repair -> rejoin Wi-Fi -> reset the\n"
+        "adapter driver -> restart WlanSvc. Driver reset needs the elevated task (or\n"
+        "an elevated shell) and is rate-limited to once per 15 min.\n",
         stdout);
     fflush(stdout);
 }
@@ -1768,9 +2296,10 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 
 static bool g_wsaOk = false;
 
-int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
+int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
     HeapSetInformation(nullptr, HeapEnableTerminationOnCorruption, nullptr, 0);
+    InitCore();
     BindConsole();
     InitLog();
     SetUnhandledExceptionFilter(CrashFilter);
@@ -1790,11 +2319,13 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 
     enum class Mode { Monitor, Once, Status, Install, Uninstall, Stop, Help };
     Mode mode = Mode::Monitor;
+    bool tray = false;
     DWORD interval = kDefaultIntervalMin;
 
     for (int i = 1; argv && i < argc; ++i) {
         std::wstring a = Lower(argv[i]);
-        if      (a == L"--once")      mode = Mode::Once;
+        if      (a == L"--tray")      tray = true;
+        else if (a == L"--once")      mode = Mode::Once;
         else if (a == L"--status")    mode = Mode::Status;
         else if (a == L"--install")   mode = Mode::Install;
         else if (a == L"--uninstall") mode = Mode::Uninstall;
@@ -1822,7 +2353,7 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
     case Mode::Uninstall: rc = CmdUninstall();       break;
     case Mode::Stop:      rc = CmdStop();            break;
     case Mode::Help:      PrintHelp();               break;
-    default:              rc = RunMonitor(interval); break;
+    default:              rc = StartMonitorGui(hInst, tray, interval); break;
     }
 
     if (g_wsaOk) WSACleanup();

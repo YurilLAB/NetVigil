@@ -1,9 +1,9 @@
 # NetVigil
 
 Small Windows watchdog that keeps your internet connection alive. It runs at
-logon from a scheduled task, probes connectivity every 10 minutes (configurable)
-and, when the connection is confirmed down, escalates through increasingly
-heavy repairs until it is back:
+logon from a scheduled task, lives in the system tray, probes connectivity
+every 10 minutes (configurable) and, when the connection is confirmed down,
+escalates through increasingly heavy repairs until it is back:
 
 1. **Rejoin Wi-Fi** — re-enable a software-disabled radio and a disabled WLAN
    auto-config, scan, and walk the in-range remembered networks best-signal
@@ -58,14 +58,56 @@ disable/enable devices on 64-bit Windows.
 ## Usage
 
 ```
-NetVigil.exe                 run the monitor loop (default 10 min interval)
-NetVigil.exe --interval N    monitor with an N-minute check interval (1-1440)
+NetVigil.exe                 open the window (starts the watchdog if it isn't running)
+NetVigil.exe --tray          start hidden in the tray (what the logon task runs)
+NetVigil.exe --interval N    check every N minutes (1-1440; persisted in netvigil.ini)
 NetVigil.exe --install       register + start the logon task (prompts for UAC)
-NetVigil.exe --uninstall     stop the monitor and remove the task
-NetVigil.exe --stop          signal a running monitor to exit
+NetVigil.exe --uninstall     stop the watchdog and remove the task
+NetVigil.exe --stop          signal the running watchdog to exit
 NetVigil.exe --status        show adapters, probe results, task state, verdict
 NetVigil.exe --once          one check; remediate if offline; exit
 ```
+
+## The window
+
+A single small window, plain Win32, nothing to install. **Closing it does not
+stop NetVigil** — the window hides and the watchdog keeps running in the tray;
+exit from the tray icon's menu. Launching `NetVigil.exe` again just brings the
+running instance's window back (even from a non-elevated shell). The tray icon
+is a coloured dot: green online, red offline, amber degraded / portal /
+checking, grey paused.
+
+- **Status line** — online/offline/degraded/portal, the network you're on, the
+  adapter, last and next check, how long you've been offline, and what the
+  repair ladder is doing right now.
+- **Networks** — every saved Wi-Fi profile plus every network NetVigil has
+  seen you connected to, with signal (or "not in range"), last-connected time
+  and connect count. Select one and choose its **auto-connect policy**:
+  - *Preferred* — tried first whenever it is in range (one network at a time).
+  - *Allowed* (default) — tried in signal-strength order.
+  - *Never connect* — skipped by the reconnect logic even if it has a saved
+    profile (good for the neighbour's hotspot you joined once).
+  **Connect now** (or double-click) switches to the selected network on the
+  spot and verifies internet a few seconds later.
+- **Check now / Pause** — force a check, or pause the watchdog (e.g. while you
+  deliberately work offline or sign into a captive portal).
+- **Check every N min / Apply** — change the interval live; it persists.
+- **Show notifications** — tray balloons when the connection is restored or a
+  repair fails.
+- **Recent activity** — the live tail of the log.
+
+Preferences and the remembered-network list live in
+`%LOCALAPPDATA%\NetVigil\netvigil.ini` (UTF-16, plain INI: `[settings]`,
+`[networks]`, `[seen]`). NetVigil records the network it is on at every
+check, so the list fills itself in over time.
+
+## Resource use
+
+The UI thread sleeps in `GetMessage`; the watchdog runs on a below-normal
+priority worker thread that waits on events between checks (no polling), and
+the process trims its working set before every idle interval. With the window
+hidden it sits at a few hundred KB and 0% CPU; the window is only refreshed
+while it is visible.
 
 `--install` copies the exe to `%ProgramFiles%\NetVigil\` and points the
 scheduled task there — the task runs elevated at every logon, so it must never
@@ -78,6 +120,7 @@ interactive session — meaning any process in your session can also stop the
 watchdog, which is intentional (it's a convenience, not a security boundary).
 
 Log: `%LOCALAPPDATA%\NetVigil\netvigil.log` (rotated at 1 MiB to `.old`).
+Settings + remembered networks: `%LOCALAPPDATA%\NetVigil\netvigil.ini`.
 
 ## How it decides "online"
 
