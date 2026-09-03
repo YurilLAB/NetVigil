@@ -5,18 +5,39 @@ logon from a scheduled task, probes connectivity every 10 minutes (configurable)
 and, when the connection is confirmed down, escalates through increasingly
 heavy repairs until it is back:
 
-1. **Rejoin Wi-Fi** — turn a software-disabled radio back on, scan, and walk
-   the in-range remembered networks best-signal first (falling back to the
-   saved profile list for hidden APs). Each candidate is verified for actual
-   internet after associating — a strong-signal but internet-dead network
-   doesn't shadow a weaker one that works. If Wi-Fi says "connected" but the
-   internet is dead, the association is bounced (disconnect + reconnect).
-2. **Reset the adapter driver** — disable/enable the Wi-Fi adapter device via
+1. **Rejoin Wi-Fi** — re-enable a software-disabled radio and a disabled WLAN
+   auto-config, scan, and walk the in-range remembered networks best-signal
+   first (falling back to the saved profile list for hidden APs). Each
+   candidate is verified for actual internet after associating — a
+   strong-signal but internet-dead network doesn't shadow a weaker one that
+   works. If Wi-Fi says "connected" but the internet is dead, the association
+   is bounced (disconnect + reconnect).
+2. **Repair the IP layer** — if the link is up but the IP config is broken
+   (APIPA `169.254.x.x` self-assigned address, no address, or a lost default
+   gateway after a router restart), release + renew the DHCP lease. Virtual
+   and VPN adapters (Tailscale, Hyper-V, WSL, etc.) are never touched, and a
+   wired subnet with no default route (NAS/lab link) is not treated as broken.
+   If the Wi-Fi network's *own* gateway answers pings while the internet is
+   dead, the outage is upstream (ISP/router WAN) — NetVigil says so, leaves
+   the healthy association alone, and skips the driver reset instead of
+   thrashing hardware that isn't the problem. This triage runs *before* any
+   reconnect, so a working association is never bounced during an ISP outage.
+3. **Reset the adapter driver** — disable/enable the Wi-Fi adapter device via
    SetupAPI (the same thing Device Manager does). Works for internal and
    external/USB adapters; if the adapter has wedged so hard it no longer shows
    up in WlanSvc, a heuristic pass resets any present wireless-looking network
-   device instead.
-3. **Restart WlanSvc** (the WLAN AutoConfig service) and reconnect again.
+   device instead. If driver resets keep turning out to be the thing that
+   revives the connection (twice, with the connection actually coming back
+   each time), Windows' permission to power the adapter down is removed
+   (`PnPCapabilities=0x18`) — the classic cure for USB Wi-Fi adapters that
+   die from selective suspend. Futile resets during AP/ISP outages never
+   trigger this.
+4. **Restart WlanSvc** (the WLAN AutoConfig service) and reconnect again.
+
+The **degraded** state (pings work, HTTP/DNS dead) gets its own lightweight,
+rate-limited repair without touching Wi-Fi: if a proxy-bypassing request
+works, the system proxy is named as the culprit; otherwise the DNS resolver
+cache is flushed and connectivity re-tested.
 
 Driver resets are rate-limited to once per 15 minutes so a dead ISP or captive
 portal can't make it thrash your hardware. While the connection is down, checks
@@ -72,7 +93,9 @@ Two independent HTTP probes (Microsoft NCSI `connecttest.txt`, Google
 
 A loss is only acted on after a 30 s confirmation re-check (90 s for the first
 check after start, to let logon settle). Resume from sleep is detected and
-triggers an immediate check instead of waiting out the interval.
+triggers an immediate check instead of waiting out the interval. When a loss
+is confirmed, a snapshot of every adapter (IP, gateway, DNS, APIPA state) is
+logged, and recovery lines report how long the connection was down.
 
 ## Limitations
 

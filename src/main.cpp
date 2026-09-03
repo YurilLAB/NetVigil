@@ -412,18 +412,23 @@ static ProbeResult HttpProbe(const wchar_t* host, const wchar_t* path,
     return r;
 }
 
-static bool PingProbe(const char* ipStr)
+static bool PingAddr(IPAddr addr)
 {
-    IN_ADDR addr{};
-    if (InetPtonA(AF_INET, ipStr, &addr) != 1) return false;
     ScopedIcmp icmp(IcmpCreateFile());
     if (icmp.h == INVALID_HANDLE_VALUE) return false;
     char payload[32] = "NetVigil-probe";
     BYTE reply[sizeof(ICMP_ECHO_REPLY) + sizeof payload + 8] = {};
-    DWORD n = IcmpSendEcho(icmp.h, addr.S_un.S_addr, payload, sizeof payload,
+    DWORD n = IcmpSendEcho(icmp.h, addr, payload, sizeof payload,
                            nullptr, reply, sizeof reply, 3000);
     if (n == 0) return false;
     return ((PICMP_ECHO_REPLY)reply)->Status == IP_SUCCESS;
+}
+
+static bool PingProbe(const char* ipStr)
+{
+    IN_ADDR addr{};
+    if (InetPtonA(AF_INET, ipStr, &addr) != 1) return false;
+    return PingAddr(addr.S_un.S_addr);
 }
 
 static Net CheckInternet()
@@ -440,6 +445,227 @@ static Net CheckInternet()
     if (ping)          return httpResponded ? Net::Portal : Net::Degraded;
     if (httpResponded) return Net::Portal;
     return Net::Offline;
+}
+
+// ---------------------------------------------------------------- IP layer
+
+static DWORD RunProcess(const std::wstring& cmdLine, bool quiet); // fwd
+
+struct AdapterIpInfo {
+    std::wstring name;
+    DWORD  ifIndex   = 0;
+    bool   up        = false;
+    bool   wireless  = false;
+    bool   virt      = false;   // virtual/VPN/tunnel — never DHCP-repair these
+    bool   dhcp      = false;
+    bool   hasIpv4   = false;
+    bool   apipa     = false;   // 169.254.x.x — DHCP never answered
+    bool   hasGateway = false;
+    IN_ADDR gateway{};
+    std::wstring ipv4, gatewayStr, dns;
+};
+
+static std::wstring Ipv4ToStr(const IN_ADDR& a)
+{
+    wchar_t buf[32] = {};
+    InetNtopW(AF_INET, (PVOID)&a, buf, 32);
+    return buf;
+}
+
+static bool LooksVirtualAdapter(const std::wstring& lowerText)
+{
+    static const wchar_t* kVirt[] = { L"virtual", L"vpn", L"tap", L"tun",
+                                      L"loopback", L"vethernet", L"hyper-v",
+                                      L"wsl", L"bluetooth", L"tunnel",
+                                      L"tailscale", L"zerotier", L"wireguard",
+                                      L"wintun" };
+    for (const wchar_t* k : kVirt)
+        if (lowerText.find(k) != std::wstring::npos) return true;
+    return false;
+}
+
+static std::vector<AdapterIpInfo> SnapshotAdapters()
+{
+    std::vector<AdapterIpInfo> out;
+    ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST |
+                  GAA_FLAG_SKIP_MULTICAST;
+    ULONG sz = 16 * 1024;
+    std::vector<BYTE> buf;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < 3 && rc == ERROR_BUFFER_OVERFLOW; ++attempt) {
+        buf.resize(sz);
+        rc = GetAdaptersAddresses(AF_INET, flags, nullptr,
+                                  (IP_ADAPTER_ADDRESSES*)buf.data(), &sz);
+    }
+    if (rc != ERROR_SUCCESS) {
+        Logf(L"GetAdaptersAddresses failed (%u)", rc);
+        return out;
+    }
+    for (auto* a = (IP_ADAPTER_ADDRESSES*)buf.data(); a; a = a->Next) {
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        AdapterIpInfo inf;
+        inf.name     = a->FriendlyName ? a->FriendlyName : L"";
+        inf.ifIndex  = a->IfIndex;
+        inf.up       = (a->OperStatus == IfOperStatusUp);
+        inf.wireless = (a->IfType == IF_TYPE_IEEE80211);
+        inf.dhcp     = (a->Dhcpv4Enabled != 0);
+        std::wstring desc = a->Description ? a->Description : L"";
+        inf.virt     = LooksVirtualAdapter(Lower(inf.name + L" " + desc));
+        for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
+            if (ua->Address.lpSockaddr && ua->Address.lpSockaddr->sa_family == AF_INET) {
+                IN_ADDR ip = ((sockaddr_in*)ua->Address.lpSockaddr)->sin_addr;
+                inf.hasIpv4 = true;
+                inf.apipa = (ip.S_un.S_un_b.s_b1 == 169 && ip.S_un.S_un_b.s_b2 == 254);
+                inf.ipv4 = Ipv4ToStr(ip);
+                break;
+            }
+        }
+        for (auto* ga = a->FirstGatewayAddress; ga; ga = ga->Next) {
+            if (ga->Address.lpSockaddr && ga->Address.lpSockaddr->sa_family == AF_INET) {
+                inf.gateway = ((sockaddr_in*)ga->Address.lpSockaddr)->sin_addr;
+                inf.hasGateway = true;
+                inf.gatewayStr = Ipv4ToStr(inf.gateway);
+                break;
+            }
+        }
+        int dnsCount = 0;
+        for (auto* da = a->FirstDnsServerAddress; da && dnsCount < 2; da = da->Next) {
+            if (da->Address.lpSockaddr && da->Address.lpSockaddr->sa_family == AF_INET) {
+                if (dnsCount) inf.dns += L", ";
+                inf.dns += Ipv4ToStr(((sockaddr_in*)da->Address.lpSockaddr)->sin_addr);
+                ++dnsCount;
+            }
+        }
+        out.push_back(std::move(inf));
+    }
+    return out;
+}
+
+static void LogNetSnapshot()
+{
+    std::vector<AdapterIpInfo> ads = SnapshotAdapters();
+    if (ads.empty()) {
+        Logf(L"  [ip] no adapters visible to the IP stack");
+        return;
+    }
+    for (const auto& a : ads) {
+        if (!a.up && !a.wireless) continue; // down virtual clutter
+        Logf(L"  [ip] %ls: %ls, ip %ls%ls, gw %ls, dns %ls",
+             a.name.c_str(), a.up ? L"up" : L"down",
+             a.hasIpv4 ? a.ipv4.c_str() : L"none",
+             a.apipa ? L" (APIPA — DHCP failed)" : L"",
+             a.hasGateway ? a.gatewayStr.c_str() : L"none",
+             a.dns.empty() ? L"none" : a.dns.c_str());
+    }
+}
+
+// Release + renew the DHCP lease on one adapter — the fix for an APIPA
+// address or a lost gateway after the AP/router restarted.
+static bool RenewDhcp(DWORD ifIndex, const std::wstring& name)
+{
+    ULONG sz = 0;
+    DWORD rc = GetInterfaceInfo(nullptr, &sz);
+    if (rc != ERROR_INSUFFICIENT_BUFFER || sz == 0) {
+        Logf(L"  GetInterfaceInfo failed (%u)", rc);
+        return false;
+    }
+    std::vector<BYTE> buf(sz);
+    IP_INTERFACE_INFO* info = (IP_INTERFACE_INFO*)buf.data();
+    rc = GetInterfaceInfo(info, &sz);
+    if (rc != NO_ERROR) {
+        Logf(L"  GetInterfaceInfo failed (%u)", rc);
+        return false;
+    }
+    for (LONG i = 0; i < info->NumAdapters; ++i) {
+        if (info->Adapter[i].Index != ifIndex) continue;
+        Logf(L"  [%ls] releasing + renewing DHCP lease", name.c_str());
+        DWORD rr = IpReleaseAddress(&info->Adapter[i]);
+        if (rr != NO_ERROR)
+            Logf(L"  IpReleaseAddress rc=%u (continuing)", rr);
+        Sleep(1000);
+        rr = IpRenewAddress(&info->Adapter[i]);
+        Logf(rr == NO_ERROR ? L"  [%ls] DHCP renew ok"
+                            : L"  [%ls] DHCP renew failed (%u)", name.c_str(), rr);
+        return rr == NO_ERROR;
+    }
+    Logf(L"  [%ls] not in the DHCP interface table (static IP?)", name.c_str());
+    return false;
+}
+
+static void FlushDnsCache()
+{
+    typedef BOOL(WINAPI* PfnFlush)(void);
+    static PfnFlush flush = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (HMODULE m = LoadLibraryW(Sys32(L"dnsapi.dll").c_str()))
+            flush = (PfnFlush)GetProcAddress(m, "DnsFlushResolverCache");
+    }
+    if (flush && flush()) {
+        Logf(L"DNS resolver cache flushed");
+        return;
+    }
+    DWORD rc = RunProcess(L"\"" + Sys32(L"ipconfig.exe") + L"\" /flushdns", true);
+    Logf(rc == 0 ? L"DNS resolver cache flushed (ipconfig)"
+                 : L"DNS cache flush failed (rc=%u)", rc);
+}
+
+// Degraded = ICMP works but HTTP/DNS fails. Try cheap repairs without
+// touching Wi-Fi: proxy diagnosis, DNS cache flush. Rate-limited so a real
+// upstream DNS outage doesn't get flushed every cycle.
+static Net DiagnoseDegraded()
+{
+    static ULONGLONG lastFix = 0;
+    ULONGLONG now = GetTickCount64();
+    if (lastFix != 0 && now - lastFix < 30ull * 60 * 1000) return Net::Degraded;
+    lastFix = now;
+
+    // If a proxy-bypassing request works, the system proxy is the problem —
+    // not something a watchdog should rewrite, but worth naming precisely.
+    ScopedWinHttp direct(WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (direct.h) {
+        WinHttpSetTimeouts(direct.h, 5000, 5000, 5000, 5000);
+        ScopedWinHttp con(WinHttpConnect(direct.h, L"www.msftconnecttest.com",
+                                         INTERNET_DEFAULT_HTTP_PORT, 0));
+        ScopedWinHttp req(con.h ? WinHttpOpenRequest(con.h, L"GET", L"/connecttest.txt",
+                                                     nullptr, WINHTTP_NO_REFERER,
+                                                     WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
+                                : nullptr);
+        if (req.h &&
+            WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(req.h, nullptr)) {
+            Logf(L"proxy failure suspected: direct HTTP works but the configured "
+                 L"proxy path fails — check the system proxy settings");
+            return Net::Degraded;
+        }
+    }
+
+    FlushDnsCache();
+    Sleep(2000);
+    Net n = CheckInternet();
+    Logf(n == Net::Online ? L"DNS cache flush restored HTTP connectivity"
+                          : L"still degraded after DNS flush (upstream DNS problem?)");
+    return n;
+}
+
+// Does any Wi-Fi adapter's own gateway answer? That specific combination —
+// wireless link up, its router reachable, internet dead — proves the Wi-Fi
+// path is healthy and the outage is upstream. A live gateway on some OTHER
+// NIC (ethernet to a NAS subnet, a phone tether) proves nothing about Wi-Fi.
+static bool WifiGatewayAlive()
+{
+    for (const auto& a : SnapshotAdapters()) {
+        if (!a.up || a.virt || !a.wireless || !a.hasGateway) continue;
+        if (PingAddr(a.gateway.S_un.S_addr)) {
+            Logf(L"[%ls] gateway %ls answers ping", a.name.c_str(),
+                 a.gatewayStr.c_str());
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------- WLAN
@@ -468,7 +694,11 @@ static HANDLE OpenWlan()
 {
     DWORD ver = 0;
     HANDLE h = nullptr;
-    if (WlanOpenHandle(2, nullptr, &ver, &h) != ERROR_SUCCESS) return nullptr;
+    DWORD rc = WlanOpenHandle(2, nullptr, &ver, &h);
+    if (rc != ERROR_SUCCESS) {
+        Logf(L"WlanOpenHandle failed (%u)", rc);
+        return nullptr;
+    }
     return h;
 }
 
@@ -557,6 +787,25 @@ static bool EnsureRadioOn(HANDLE h, const GUID& g)
     return flipped;
 }
 
+// Windows only auto-reconnects when WLAN auto-config is on; something (a
+// tool, a stray netsh) can leave it off and strand the interface.
+static void EnsureAutoConfig(HANDLE h, const GUID& g, const std::wstring& desc)
+{
+    ScopedWlanMem mem;
+    DWORD sz = 0;
+    WLAN_OPCODE_VALUE_TYPE t;
+    if (WlanQueryInterface(h, &g, wlan_intf_opcode_autoconf_enabled, nullptr,
+                           &sz, &mem.p, &t) != ERROR_SUCCESS ||
+        !mem.p || sz < sizeof(BOOL))
+        return;
+    if (*mem.as<BOOL>()) return;
+    BOOL on = TRUE;
+    DWORD rc = WlanSetInterface(h, &g, wlan_intf_opcode_autoconf_enabled,
+                                sizeof on, &on, nullptr);
+    Logf(L"  [%ls] WLAN auto-config was disabled -> re-enabled (rc=%u)",
+         desc.c_str(), rc);
+}
+
 struct Candidate {
     std::wstring profile;
     DOT11_BSS_TYPE bss = dot11_BSS_type_infrastructure;
@@ -616,6 +865,7 @@ static bool WaitConnected(HANDLE h, const GUID& g, DWORD ms)
 // Try to get one interface associated to a remembered network.
 static bool ReconnectIface(HANDLE h, const WlanIfaceInfo& inf, bool bounceIfConnected)
 {
+    EnsureAutoConfig(h, inf.guid, inf.desc);
     if (EnsureRadioOn(h, inf.guid)) Sleep(3000);
 
     WLAN_INTERFACE_STATE st = GetIfaceState(h, inf.guid);
@@ -632,6 +882,9 @@ static bool ReconnectIface(HANDLE h, const WlanIfaceInfo& inf, bool bounceIfConn
     }
 
     DWORD src = WlanScan(h, &inf.guid, nullptr, nullptr, nullptr);
+    if (src != ERROR_SUCCESS)
+        Logf(L"  [%ls] WlanScan failed (%u) — using cached scan results",
+             inf.desc.c_str(), src);
     if (WaitStop(src == ERROR_SUCCESS ? 4500 : 1000)) // scan completes asynchronously
         return false;
 
@@ -796,10 +1049,39 @@ static bool LooksWireless(const std::wstring& descLower)
     return false;
 }
 
+// A repeatedly-dying adapter (USB Wi-Fi especially) is often being powered
+// down by Windows. PnPCapabilities=0x18 removes the power-off capability;
+// it takes effect on the disable/enable cycle that follows.
+static void DisableAdapterPowerSaving(HDEVINFO devs, SP_DEVINFO_DATA* did,
+                                      const std::wstring& desc)
+{
+    ScopedRegKey key(SetupDiOpenDevRegKey(devs, did, DICS_FLAG_GLOBAL, 0,
+                                          DIREG_DRV, KEY_READ | KEY_SET_VALUE));
+    if (key.k == (HKEY)INVALID_HANDLE_VALUE) {
+        Logf(L"  [%ls] cannot open driver key to adjust power management (%u)",
+             desc.c_str(), GetLastError());
+        return;
+    }
+    DWORD val = 0x18;
+    DWORD cur = 0, curSz = sizeof cur, type = 0;
+    if (RegQueryValueExW(key.k, L"PnPCapabilities", nullptr, &type,
+                         (PBYTE)&cur, &curSz) == ERROR_SUCCESS &&
+        type == REG_DWORD && cur == val)
+        return; // already applied
+    LONG rc = RegSetValueExW(key.k, L"PnPCapabilities", 0, REG_DWORD,
+                             (const BYTE*)&val, sizeof val);
+    Logf(rc == ERROR_SUCCESS
+             ? L"  [%ls] repeated resets needed — disabled Windows power-down "
+               L"for this adapter (PnPCapabilities=0x18)"
+             : L"  [%ls] failed to adjust adapter power management (rc=%ld)",
+         desc.c_str(), rc);
+}
+
 // Disable/enable Wi-Fi adapters (a driver-level reset). If targetIds is
 // empty — the adapter vanished from WlanSvc — fall back to resetting present
-// net-class devices that look wireless. Returns how many were reset.
-static int ResetWifiAdapters(const std::vector<std::wstring>& targetIds)
+// net-class devices that look wireless. When fixPower is set, also stop
+// Windows from powering the adapter down. Returns how many were reset.
+static int ResetWifiAdapters(const std::vector<std::wstring>& targetIds, bool fixPower)
 {
     int resetCount = 0;
     ScopedDevInfo devInfo(SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr,
@@ -830,6 +1112,8 @@ static int ResetWifiAdapters(const std::vector<std::wstring>& targetIds)
             Logf(L"  disable failed (%u)", GetLastError());
             continue;
         }
+        if (fixPower)
+            DisableAdapterPowerSaving(devs, &did, desc); // applies on the enable
         Sleep(3000);
         if (!ChangeDevState(devs, &did, DICS_ENABLE)) {
             Logf(L"  enable failed (%u) — retrying", GetLastError());
@@ -908,13 +1192,63 @@ static bool StartOrRestartWlanSvc(bool forceRestart)
 
 // ---------------------------------------------------------------- remediation
 
+// Driver resets that were followed by connectivity coming back — evidence
+// that the adapter keeps dying and the reset is what revives it. Two of
+// those justify the persistent power-management fix; futile resets (AP down,
+// ISP out) never count.
+static int g_effectiveResets = 0;
+
+static ULONGLONG kDhcpRenewCooldownMs = 10ull * 60 * 1000;
+static ULONGLONG g_lastDhcpRenew = 0;
+
 // Escalating repair. Returns connectivity state afterwards.
 static Net Remediate(Net current, ULONGLONG& lastResetTick)
 {
-    // Stage 1: rejoin Wi-Fi. Behind a captive portal the AP itself works,
-    // so only attach disconnected interfaces instead of bouncing good ones.
+    // Stage 0: IP-layer triage BEFORE touching the association, so a healthy
+    // link is never bounced when the problem is not the Wi-Fi link at all.
+    bool upstreamSuspected = false;
+    {
+        std::vector<AdapterIpInfo> ads = SnapshotAdapters();
+        bool renewed = false;
+        for (const auto& a : ads) {
+            if (!a.up || a.virt || !a.dhcp) continue;
+            // A gateway-less lease is only "broken" on Wi-Fi — wired subnets
+            // can legitimately have no default route (NAS/lab links).
+            bool broken = !a.hasIpv4 || a.apipa || (a.wireless && !a.hasGateway);
+            if (!broken) continue;
+            Logf(L"[%ls] broken IP configuration (%ls)", a.name.c_str(),
+                 !a.hasIpv4 ? L"no IPv4 address"
+                            : a.apipa ? L"APIPA self-assigned address"
+                                      : L"no default gateway");
+            if (!g_elevated) {
+                Logf(L"  DHCP repair skipped: not elevated");
+                continue;
+            }
+            ULONGLONG now = GetTickCount64();
+            if (g_lastDhcpRenew != 0 && now - g_lastDhcpRenew < kDhcpRenewCooldownMs) {
+                Logf(L"  DHCP repair skipped: cooldown");
+                continue;
+            }
+            g_lastDhcpRenew = now;
+            renewed = RenewDhcp(a.ifIndex, a.name) || renewed;
+        }
+        if (renewed) {
+            if (WaitStop(3000)) return current;
+            Net r = CheckInternet();
+            Logf(L"after DHCP repair: %ls", NetToStr(r));
+            if (r != Net::Offline) return r;
+        }
+        upstreamSuspected = WifiGatewayAlive();
+        if (upstreamSuspected)
+            Logf(L"Wi-Fi gateway responds while the internet is down — "
+                 L"upstream/ISP outage suspected; keeping the current association");
+    }
+
+    // Stage 1: rejoin Wi-Fi. Behind a captive portal or during an upstream
+    // outage the association itself is fine — only attach disconnected
+    // interfaces instead of bouncing a good one.
     Logf(L"remediation stage 1: Wi-Fi reconnect");
-    WifiReconnectAll(/*bounceIfConnected=*/current != Net::Portal);
+    WifiReconnectAll(/*bounceIfConnected=*/current != Net::Portal && !upstreamSuspected);
     if (WaitStop(5000)) return current;
     Net n = CheckInternet();
     Logf(L"after stage 1: %ls", NetToStr(n));
@@ -922,6 +1256,15 @@ static Net Remediate(Net current, ULONGLONG& lastResetTick)
     if (n == Net::Portal) {
         Logf(L"captive portal suspected — driver reset would not help; "
              L"complete the portal sign-in in a browser");
+        return n;
+    }
+
+    // If the Wi-Fi path's own gateway answers, the driver is fine and the
+    // outage is upstream — resetting hardware cannot bring the internet back.
+    if (StopRequested()) return n;
+    if (WifiGatewayAlive()) {
+        Logf(L"upstream/ISP outage — skipping driver reset, retrying on the "
+             L"short interval");
         return n;
     }
 
@@ -941,7 +1284,7 @@ static Net Remediate(Net current, ULONGLONG& lastResetTick)
 
     Logf(L"remediation stage 2: Wi-Fi adapter driver reset");
     std::vector<std::wstring> ids = CurrentWlanAdapterIds();
-    int cnt = ResetWifiAdapters(ids);
+    int cnt = ResetWifiAdapters(ids, g_effectiveResets >= 2);
     if (cnt == 0) {
         Logf(L"no adapter could be reset — restarting WlanSvc instead");
         StartOrRestartWlanSvc(true);
@@ -951,6 +1294,7 @@ static Net Remediate(Net current, ULONGLONG& lastResetTick)
     if (WaitStop(5000)) return n;
     n = CheckInternet();
     Logf(L"after stage 2: %ls", NetToStr(n));
+    if (cnt > 0 && n != Net::Offline) ++g_effectiveResets; // the reset worked
     if (n == Net::Online || n == Net::Degraded || n == Net::Portal) return n;
 
     // Stage 3: WlanSvc restart as the last resort (unless it was just done).
@@ -1027,15 +1371,22 @@ static int RunMonitor(DWORD intervalMin)
     int  failStreak = 0;
     ULONGLONG lastReset = 0;
     ULONGLONG lastOkLog = 0;
+    ULONGLONG offlineSince = 0;
 
     for (;;) {
         Net n = CheckInternet();
 
         if (n == Net::Online || n == Net::Degraded) {
-            if (failStreak > 0) Logf(L"connectivity restored");
-            if (n == Net::Degraded)
-                Logf(L"degraded: ICMP works but HTTP/DNS failing — no action taken");
-            else if (GetTickCount64() - lastOkLog > 3600000ull) {
+            if (failStreak > 0) {
+                Logf(L"connectivity restored after %llu min offline",
+                     offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0);
+                offlineSince = 0;
+            }
+            if (n == Net::Degraded) {
+                Logf(L"degraded: ICMP works but HTTP/DNS failing — "
+                     L"attempting lightweight repair");
+                DiagnoseDegraded(); // proxy diagnosis + DNS flush, rate-limited
+            } else if (GetTickCount64() - lastOkLog > 3600000ull) {
                 Logf(L"online");
                 lastOkLog = GetTickCount64();
             }
@@ -1063,12 +1414,18 @@ static int RunMonitor(DWORD intervalMin)
         }
 
         ++failStreak;
+        if (failStreak == 1) {
+            offlineSince = GetTickCount64();
+            LogNetSnapshot(); // adapter/IP/gateway/DNS state at the moment of loss
+        }
         Logf(L"confirmed %ls (streak %d) — starting remediation",
              NetToStr(n2), failStreak);
         Net after = Remediate(n2, lastReset);
 
         if (after == Net::Online || after == Net::Degraded) {
-            Logf(L"remediation succeeded — back online");
+            Logf(L"remediation succeeded — back online after %llu min",
+                 offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0);
+            offlineSince = 0;
             failStreak = 0;
             if (IntervalWait(intervalMin)) break;
         } else {
@@ -1335,6 +1692,7 @@ static int CmdStatus()
                  IfStateStr(st), extra.c_str());
         }
     }
+    LogNetSnapshot();
 
     ProbeResult a = HttpProbe(L"www.msftconnecttest.com", L"/connecttest.txt",
                               false, "Microsoft Connect Test");
@@ -1353,7 +1711,12 @@ static int CmdOnce()
 {
     Net n = CheckInternet();
     Logf(L"connectivity: %ls", NetToStr(n));
+    if (n == Net::Degraded) {
+        n = DiagnoseDegraded();
+        Logf(L"after lightweight repair: %ls", NetToStr(n));
+    }
     if (n == Net::Online || n == Net::Degraded) return 0;
+    LogNetSnapshot();
     ULONGLONG dummy = 0;
     Net after = Remediate(n, dummy);
     Logf(L"final state: %ls", NetToStr(after));
