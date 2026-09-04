@@ -21,7 +21,7 @@ if errorlevel 1 exit /b 1
 
 :have_cl
 if not exist build mkdir build
-cl /nologo /utf-8 /W4 /O2 /EHsc /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 src\main.cpp src\gui.cpp /Fo:build\ /Fe:build\NetVigil.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED
+cl /nologo /utf-8 /W4 /O2 /GL /EHsc /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 src\main.cpp src\gui.cpp /Fo:build\ /Fe:build\NetVigil.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /LTCG /OPT:REF /OPT:ICF
 if errorlevel 1 exit /b 1
 echo.
 echo Built build\NetVigil.exe

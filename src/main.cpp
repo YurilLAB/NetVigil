@@ -59,7 +59,9 @@ static const ULONGLONG kLogRotateBytes     = 1ull << 20;        // 1 MiB
 
 static std::wstring g_logPath;
 static std::wstring g_iniPath;
+static std::wstring g_dataDir;
 static bool         g_elevated  = false;
+static bool         g_helper    = false;     // --helper: temp copy running an uninstall
 static HANDLE       g_stopEvent = nullptr;   // manual-reset, named: "exit"
 static HANDLE       g_wakeEvent = nullptr;   // auto-reset: "check now"
 
@@ -219,9 +221,12 @@ static void InitLog()
     std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(buf) + L"\\NetVigil"
                                                : ExeDir();
     CreateDirectoryW(dir.c_str(), nullptr);
+    g_dataDir = dir;
     g_logPath = dir + L"\\netvigil.log";
     g_iniPath = dir + L"\\netvigil.ini";
 }
+
+const std::wstring& DataDir() { return g_dataDir; }
 
 // Attach to the parent console (when launched from a terminal) so command
 // output is visible; as a /SUBSYSTEM:WINDOWS binary we otherwise have none.
@@ -2041,6 +2046,64 @@ static std::wstring InstallDirPath()
     return pf + L"\\NetVigil";
 }
 
+// Fire-and-forget launch of ourselves (or a helper copy), elevated if asked.
+static bool LaunchDetached(const std::wstring& exe, const std::wstring& args, bool elevate)
+{
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof sei;
+    sei.fMask  = SEE_MASK_NOASYNC;
+    sei.lpVerb = elevate ? L"runas" : L"open";
+    sei.lpFile = exe.c_str();
+    sei.lpParameters = args.c_str();
+    sei.nShow  = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        Logf(L"could not start '%ls %ls' (%u)", exe.c_str(), args.c_str(), GetLastError());
+        return false;
+    }
+    return true;
+}
+
+bool IsInstalledAtStartup() { return TaskInstalled(); }
+
+bool IsRunningInstalledCopy()
+{
+    std::wstring destExe = InstallDirPath() + L"\\NetVigil.exe";
+    return _wcsicmp(ExePath().c_str(), destExe.c_str()) == 0;
+}
+
+// Both launchers stop THIS instance as part of their job (SignalRunningInstance
+// inside CmdInstall/CmdUninstall), so the window closes; after an install the
+// task's tray instance takes over.
+bool LaunchInstaller()
+{
+    Logf(L"install at startup requested from the window");
+    return LaunchDetached(ExePath(),
+                          L"--install --interval " + std::to_wstring(GetIntervalMin()),
+                          !g_elevated);
+}
+
+bool LaunchUninstaller()
+{
+    std::wstring helper = ExePath();
+    std::wstring args = L"--uninstall";
+    std::wstring destExe = InstallDirPath() + L"\\NetVigil.exe";
+    if (_wcsicmp(helper.c_str(), destExe.c_str()) == 0) {
+        // We ARE the installed copy: a helper copy in %TEMP% does the removal
+        // and deletes itself at the next reboot.
+        wchar_t tmp[MAX_PATH] = {};
+        if (!GetTempPathW(MAX_PATH, tmp)) return false;
+        std::wstring tmpExe = std::wstring(tmp) + L"NetVigil-uninstall.exe";
+        if (!CopyFileW(helper.c_str(), tmpExe.c_str(), FALSE)) {
+            Logf(L"could not create the uninstall helper (%u)", GetLastError());
+            return false;
+        }
+        helper = tmpExe;
+        args += L" --helper";
+    }
+    Logf(L"uninstall requested from the window");
+    return LaunchDetached(helper, args, !g_elevated);
+}
+
 static bool RelaunchElevated(const wchar_t* args)
 {
     std::wstring exe = ExePath();
@@ -2087,7 +2150,7 @@ static int CmdInstall(DWORD intervalMin)
     // Stop any running instance first (also releases the installed exe for
     // overwriting), and wait for it to actually exit.
     SignalRunningInstance();
-    if (!WaitInstanceExit(30000))
+    if (!WaitInstanceExit(60000))
         Logf(L"warning: a previous instance is still shutting down — "
              L"the new task instance may exit at startup; re-run "
              L"'schtasks /Run /TN NetVigil' if the monitor is not running");
@@ -2136,7 +2199,7 @@ static int CmdUninstall()
 {
     if (!g_elevated) {
         Logf(L"elevation required to remove the startup task — requesting UAC...");
-        if (!RelaunchElevated(L"--uninstall")) {
+        if (!RelaunchElevated(g_helper ? L"--uninstall --helper" : L"--uninstall")) {
             Logf(L"elevation was declined or the helper failed — "
                  L"run --uninstall from an elevated terminal (see %ls)",
                  g_logPath.c_str());
@@ -2145,7 +2208,7 @@ static int CmdUninstall()
         return 0;
     }
     SignalRunningInstance();
-    WaitInstanceExit(30000);
+    WaitInstanceExit(60000); // a mid-repair instance can take a while to unwind
     DWORD rc = 0;
     if (!TaskInstalled()) {
         Logf(L"startup task was not installed — nothing to remove");
@@ -2177,6 +2240,8 @@ static int CmdUninstall()
             }
         }
     }
+    if (g_helper) // temp helper copy: gone at the next reboot
+        MoveFileExW(ExePath().c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
     return rc == 0 ? 0 : 1;
 }
 
@@ -2325,6 +2390,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     for (int i = 1; argv && i < argc; ++i) {
         std::wstring a = Lower(argv[i]);
         if      (a == L"--tray")      tray = true;
+        else if (a == L"--helper")    g_helper = true;
         else if (a == L"--once")      mode = Mode::Once;
         else if (a == L"--status")    mode = Mode::Status;
         else if (a == L"--install")   mode = Mode::Install;

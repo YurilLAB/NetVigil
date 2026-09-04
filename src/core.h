@@ -59,6 +59,14 @@ std::vector<KnownNetwork> GetKnownNetworks();
 void SetNetworkMode(const std::wstring& profile, NetMode mode);
 bool ConnectToNetwork(const std::wstring& profile);
 
+// Startup integration (Settings page). Both launchers hand the work to an
+// elevated helper process which stops THIS instance as part of the job.
+bool IsInstalledAtStartup();
+bool IsRunningInstalledCopy();            // this exe IS %ProgramFiles%\NetVigil\NetVigil.exe
+bool LaunchInstaller();
+bool LaunchUninstaller();
+const std::wstring& DataDir();            // %LOCALAPPDATA%\NetVigil
+
 // Log lines appended since `seq` (bounded ring); `seq` advances to the newest.
 std::vector<std::wstring> GetLogSince(unsigned long long& seq);
 

@@ -1,9 +1,11 @@
 // gui.cpp — NetVigil's small resident window + tray icon.
 //
 // Plain Win32, no resources: icons are drawn at runtime, controls are created
-// by hand. The window is a view over the core's state; the watchdog itself
-// runs on a worker thread and the UI thread sleeps in GetMessage. Closing the
-// window hides it to the tray — only the tray menu's Exit stops the watchdog.
+// by hand. Two tabs — Status (network list, actions, log tail) and a very
+// small Settings page. The window is a view over the core's state; the
+// watchdog itself runs on a worker thread and the UI thread sleeps in
+// GetMessage. Closing the window hides it to the tray — only the tray menu's
+// Exit (or Uninstall) stops the watchdog.
 
 #include "core.h"
 #include <commctrl.h>
@@ -32,34 +34,55 @@ const UINT WM_CORE = WM_APP + 2;   // wParam = UiEvent
 const UINT_PTR ID_TIMER_UI = 1, ID_TIMER_RECHECK = 2;
 
 enum : int {
-    ID_STATUS = 100, ID_DETAIL, ID_LIST, ID_BTN_PREF, ID_BTN_ALLOW, ID_BTN_NEVER,
-    ID_BTN_CONNECT, ID_BTN_CHECK, ID_BTN_PAUSE, ID_EDIT_INTERVAL, ID_BTN_APPLY,
-    ID_CHK_NOTIFY, ID_BTN_LOGDIR, ID_LOG, ID_LBL_NETS, ID_LBL_INT, ID_LBL_MIN, ID_LBL_LOG,
+    ID_TABS = 100,
+    // Status page
+    ID_STATUS, ID_DETAIL, ID_LBL_NETS, ID_LIST, ID_BTN_PREF, ID_BTN_ALLOW, ID_BTN_NEVER,
+    ID_BTN_CONNECT, ID_BTN_CHECK, ID_BTN_PAUSE, ID_LBL_LOG, ID_LOG,
+    // Settings page
+    ID_LBL_INT, ID_EDIT_INTERVAL, ID_LBL_MIN, ID_BTN_APPLY, ID_CHK_NOTIFY,
+    ID_LBL_STARTUP, ID_STARTUP_STATE, ID_BTN_INSTALL, ID_LBL_FILES, ID_FILES_PATH,
+    ID_BTN_LOGDIR, ID_LBL_UNINST, ID_UNINST_INFO, ID_BTN_UNINSTALL, ID_ABOUT,
+    // tray menu
     TC_OPEN = 200, TC_CHECK, TC_PAUSE, TC_EXIT,
 };
 
+enum Page { PageStatus = 0, PageSettings = 1 };
 enum IconKind { IconOnline, IconOffline, IconWarn, IconPaused, IconCount };
 
 struct Gui {
     HINSTANCE hInst = nullptr;
-    HWND hwnd = nullptr, status = nullptr, detail = nullptr, list = nullptr,
-         log = nullptr, interval = nullptr, chkNotify = nullptr, btnPause = nullptr;
-    HFONT font = nullptr, fontBig = nullptr, fontMono = nullptr;
+    HWND hwnd = nullptr, tabs = nullptr, status = nullptr, detail = nullptr,
+         list = nullptr, log = nullptr, interval = nullptr, chkNotify = nullptr,
+         btnPause = nullptr, startupState = nullptr, btnInstall = nullptr;
+    std::vector<HWND> pages[2];
+    int page = PageStatus;
+    HFONT font = nullptr, fontBold = nullptr, fontBig = nullptr, fontMono = nullptr;
     HICON icons[IconCount] = {};
-    IconKind statusIcon = IconWarn;
+    IconKind statusIcon = IconWarn;   // colour of the status line
+    IconKind trayIcon = IconWarn;     // what the tray currently shows
     NOTIFYICONDATAW nid{};
-    std::wstring lastTip;
+    std::wstring lastTip, exitNote;
     HANDLE worker = nullptr;
     UINT taskbarCreated = 0;
     unsigned long long logSeq = 0;
+    ULONGLONG listedCheck = 0;        // lastCheck the network list was built for
     std::vector<KnownNetwork> rows;
     int dpi = 96;
-    bool visible = false;
-    bool trayAdded = false;
-    bool hideHintShown = false;
+    bool visible = false, trayAdded = false, hideHintShown = false;
 } g;
 
 int S(int v) { return MulDiv(v, g.dpi, 96); }
+
+// SetWindowText repaints even when nothing changed; the status line is
+// refreshed every second, so skip the no-op case.
+void SetTextIfChanged(HWND h, const std::wstring& text)
+{
+    wchar_t cur[512];
+    int n = GetWindowTextW(h, cur, 512);
+    if (n == 0 && text.empty()) return;
+    if (n > 0 && n < 511 && text.compare(cur) == 0) return;
+    SetWindowTextW(h, text.c_str());
+}
 
 // ---------------------------------------------------------------- drawing
 
@@ -126,6 +149,9 @@ void CreateFonts()
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
     LOGFONTW lf = ncm.lfMessageFont;
     g.font = CreateFontIndirectW(&lf);
+    LOGFONTW bold = lf;
+    bold.lfWeight = FW_SEMIBOLD;
+    g.fontBold = CreateFontIndirectW(&bold);
     LOGFONTW big = lf;
     big.lfHeight = MulDiv(lf.lfHeight, 15, 10);
     big.lfWeight = FW_SEMIBOLD;
@@ -177,7 +203,7 @@ void AddTray()
     g.nid.uID = 1;
     g.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g.nid.uCallbackMessage = WM_TRAY;
-    g.nid.hIcon = g.icons[g.statusIcon];
+    g.nid.hIcon = g.icons[g.trayIcon];
     wcscpy_s(g.nid.szTip, L"NetVigil");
     g.trayAdded = Shell_NotifyIconW(NIM_ADD, &g.nid) != FALSE;
     if (!g.trayAdded) {
@@ -186,7 +212,7 @@ void AddTray()
     }
     g.nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g.nid);
-    g.lastTip.clear();
+    g.lastTip.clear(); // force the next SetTray to apply
 }
 
 void RemoveTray()
@@ -199,8 +225,8 @@ void RemoveTray()
 void SetTray(IconKind k, const std::wstring& tip)
 {
     if (!g.trayAdded) return;
-    if (k == g.statusIcon && tip == g.lastTip) return; // no churn while idle
-    g.statusIcon = k;
+    if (k == g.trayIcon && tip == g.lastTip) return; // no churn while idle
+    g.trayIcon = k;
     g.lastTip = tip;
     g.nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g.nid.hIcon = g.icons[k];
@@ -248,6 +274,7 @@ std::wstring SelectedProfile()
 
 void RefreshNetworks()
 {
+    g.listedCheck = GetMonitorState().lastCheck;
     std::wstring selected = SelectedProfile();
     g.rows = GetKnownNetworks();
     SendMessageW(g.list, WM_SETREDRAW, FALSE, 0);
@@ -294,19 +321,46 @@ void AppendNewLog()
     SendMessageW(g.log, EM_SCROLLCARET, 0, 0);
 }
 
-void SyncSettings()
+// The 1 s countdown timer only runs while the Status page is on screen.
+void SyncTimer()
 {
-    SetWindowTextW(g.interval, std::to_wstring(GetIntervalMin()).c_str());
-    CheckDlgButton(g.hwnd, ID_CHK_NOTIFY, GetNotifications() ? BST_CHECKED : BST_UNCHECKED);
-    SetWindowTextW(g.btnPause, GetMonitorState().paused ? L"Resume" : L"Pause");
+    if (g.visible && g.page == PageStatus) SetTimer(g.hwnd, ID_TIMER_UI, 1000, nullptr);
+    else                                   KillTimer(g.hwnd, ID_TIMER_UI);
 }
 
-void UpdateStatus()
+void SyncSettings()
 {
-    MonitorState st = GetMonitorState();
+    SetTextIfChanged(g.interval, std::to_wstring(GetIntervalMin()));
+    CheckDlgButton(g.hwnd, ID_CHK_NOTIFY, GetNotifications() ? BST_CHECKED : BST_UNCHECKED);
+}
+
+// Spawns schtasks, so only called when the Settings page is shown.
+void SyncStartupState()
+{
+    bool installed = IsInstalledAtStartup();
+    bool thisCopy  = IsRunningInstalledCopy();
+    SetTextIfChanged(g.startupState, installed
+        ? (thisCopy
+            ? L"Installed — NetVigil starts hidden in the tray at logon, elevated so it "
+              L"can reset the Wi-Fi driver."
+            : L"Installed — but this window is a different build than the installed "
+              L"copy. Update it to run this version at logon.")
+        : L"Not installed — NetVigil only runs while you start it yourself, and "
+          L"without elevation it cannot reset the driver.");
+    SetTextIfChanged(g.btnInstall, !installed ? L"Install at startup…"
+                                  : thisCopy  ? L"Installed at startup"
+                                              : L"Update installed copy…");
+    EnableWindow(g.btnInstall, !installed || !thisCopy);
+}
+
+void UpdateStatus(const MonitorState& st)
+{
     std::wstring head;
     IconKind ic = IconWarn;
-    if (st.stopping) {
+    if (!g.exitNote.empty()) {
+        head = g.exitNote;
+        ic = IconPaused;
+    } else if (st.stopping) {
         head = L"Stopping…";
         ic = IconPaused;
     } else if (st.paused) {
@@ -324,8 +378,8 @@ void UpdateStatus()
             ic = IconOffline;
             break;
         }
+        if (!st.ssid.empty()) head += L"   ·   " + st.ssid;
     }
-    if (!st.ssid.empty() && !st.stopping) head += L"   ·   " + st.ssid;
 
     std::wstring det;
     ULONGLONG now = GetTickCount64();
@@ -344,12 +398,32 @@ void UpdateStatus()
             det += (det.empty() ? L"" : L"  ·  ") + st.iface;
         if (!st.elevated)
             det += (det.empty() ? L"" : L"  ·  ") +
-                   std::wstring(L"not elevated: driver reset unavailable (run --install)");
+                   std::wstring(L"not elevated: driver reset unavailable (see Settings)");
     }
-    SetWindowTextW(g.status, head.c_str());
-    SetWindowTextW(g.detail, det.c_str());
-    if (ic != g.statusIcon) InvalidateRect(g.status, nullptr, TRUE);
+    SetTextIfChanged(g.status, head);
+    SetTextIfChanged(g.detail, det);
+    SetTextIfChanged(g.btnPause, st.paused ? L"Resume" : L"Pause");
+    if (ic != g.statusIcon) {
+        g.statusIcon = ic;
+        InvalidateRect(g.status, nullptr, TRUE);
+    }
     SetTray(ic, L"NetVigil — " + head);
+}
+
+void ShowPage(int page)
+{
+    g.page = page;
+    TabCtrl_SetCurSel(g.tabs, page);
+    for (int p = 0; p < 2; ++p)
+        for (HWND h : g.pages[p]) ShowWindow(h, p == page ? SW_SHOW : SW_HIDE);
+    if (page == PageSettings) {
+        SyncSettings();
+        SyncStartupState();
+    } else {
+        RefreshNetworks();
+        AppendNewLog();
+    }
+    SyncTimer();
 }
 
 void ShowMain()
@@ -357,17 +431,14 @@ void ShowMain()
     g.visible = true;
     ShowWindow(g.hwnd, IsIconic(g.hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g.hwnd);
-    SyncSettings();
-    RefreshNetworks();
-    AppendNewLog();
-    UpdateStatus();
-    SetTimer(g.hwnd, ID_TIMER_UI, 1000, nullptr);
+    ShowPage(g.page);
+    UpdateStatus(GetMonitorState());
 }
 
 void HideMain()
 {
     g.visible = false;
-    KillTimer(g.hwnd, ID_TIMER_UI);
+    SyncTimer();
     ShowWindow(g.hwnd, SW_HIDE);
     if (!g.hideHintShown) {
         g.hideHintShown = true;
@@ -382,28 +453,54 @@ void HideMain()
 HWND Mk(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h,
         int id, DWORD ex = 0, HFONT font = nullptr)
 {
-    HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style,
+    HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
                              S(x), S(y), S(w), S(h), g.hwnd, (HMENU)(INT_PTR)id,
                              g.hInst, nullptr);
     if (c) SendMessageW(c, WM_SETFONT, (WPARAM)(font ? font : g.font), TRUE);
     return c;
 }
 
+HWND Add(int page, HWND h)
+{
+    g.pages[page].push_back(h);
+    return h;
+}
+
 void BuildControls()
 {
+    g.tabs = Mk(WC_TABCONTROLW, L"", WS_TABSTOP, 8, 8, 584, 464, ID_TABS);
+    TCITEMW ti{};
+    ti.mask = TCIF_TEXT;
+    ti.pszText = const_cast<LPWSTR>(L"Status");
+    TabCtrl_InsertItem(g.tabs, 0, &ti);
+    ti.pszText = const_cast<LPWSTR>(L"Settings");
+    TabCtrl_InsertItem(g.tabs, 1, &ti);
+
+    // Page origin and size (96-dpi units) from the tab's display area.
+    RECT d{};
+    GetClientRect(g.tabs, &d);
+    TabCtrl_AdjustRect(g.tabs, FALSE, &d);
+    const int ox = 8 + MulDiv(d.left, 96, g.dpi) + 6;
+    const int oy = 8 + MulDiv(d.top, 96, g.dpi) + 6;
+    const int pw = MulDiv(d.right - d.left, 96, g.dpi) - 12;
+    const int ph = MulDiv(d.bottom - d.top, 96, g.dpi) - 12;
     const DWORD btn = BS_PUSHBUTTON | WS_TABSTOP;
-    g.status = Mk(L"STATIC", L"Starting…", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
-                  12, 10, 576, 26, ID_STATUS, 0, g.fontBig);
-    g.detail = Mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
-                  12, 40, 576, 18, ID_DETAIL);
-    Mk(L"STATIC", L"Networks — choose what NetVigil auto-connects to:",
-       SS_LEFT | SS_NOPREFIX, 12, 66, 500, 16, ID_LBL_NETS);
-    g.list = Mk(WC_LISTVIEWW, L"",
-                LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_TABSTOP,
-                12, 84, 576, 180, ID_LIST, WS_EX_CLIENTEDGE);
+
+    // ---- Status page
+    g.status = Add(PageStatus, Mk(L"STATIC", L"Starting…",
+                                  SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
+                                  ox, oy, pw, 26, ID_STATUS, 0, g.fontBig));
+    g.detail = Add(PageStatus, Mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
+                                  ox, oy + 30, pw, 18, ID_DETAIL));
+    Add(PageStatus, Mk(L"STATIC", L"Networks — choose what NetVigil auto-connects to:",
+                       SS_LEFT | SS_NOPREFIX, ox, oy + 56, pw, 16, ID_LBL_NETS));
+    g.list = Add(PageStatus, Mk(WC_LISTVIEWW, L"",
+                                LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS |
+                                LVS_NOSORTHEADER | WS_TABSTOP,
+                                ox, oy + 74, pw, 170, ID_LIST, WS_EX_CLIENTEDGE));
     ListView_SetExtendedListViewStyle(g.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     const struct { const wchar_t* name; int width; } cols[] = {
-        { L"Network", 214 }, { L"Auto-connect", 96 }, { L"Signal", 92 }, { L"Last connected", 150 },
+        { L"Network", 208 }, { L"Auto-connect", 96 }, { L"Signal", 92 }, { L"Last connected", 150 },
     };
     for (int i = 0; i < 4; ++i) {
         LVCOLUMNW col{};
@@ -412,27 +509,68 @@ void BuildControls()
         col.cx = S(cols[i].width);
         ListView_InsertColumn(g.list, i, &col);
     }
-    Mk(L"BUTTON", L"Set preferred", btn, 12, 272, 104, 26, ID_BTN_PREF);
-    Mk(L"BUTTON", L"Allow", btn, 122, 272, 70, 26, ID_BTN_ALLOW);
-    Mk(L"BUTTON", L"Never connect", btn, 198, 272, 104, 26, ID_BTN_NEVER);
-    Mk(L"BUTTON", L"Connect now", btn, 308, 272, 96, 26, ID_BTN_CONNECT);
-    Mk(L"BUTTON", L"Check now", btn, 426, 272, 84, 26, ID_BTN_CHECK);
-    g.btnPause = Mk(L"BUTTON", L"Pause", btn, 516, 272, 72, 26, ID_BTN_PAUSE);
+    const int by = oy + 252;
+    Add(PageStatus, Mk(L"BUTTON", L"Set preferred", btn, ox, by, 104, 26, ID_BTN_PREF));
+    Add(PageStatus, Mk(L"BUTTON", L"Allow", btn, ox + 110, by, 70, 26, ID_BTN_ALLOW));
+    Add(PageStatus, Mk(L"BUTTON", L"Never connect", btn, ox + 186, by, 104, 26, ID_BTN_NEVER));
+    Add(PageStatus, Mk(L"BUTTON", L"Connect now", btn, ox + 296, by, 96, 26, ID_BTN_CONNECT));
+    Add(PageStatus, Mk(L"BUTTON", L"Check now", btn, ox + pw - 162, by, 84, 26, ID_BTN_CHECK));
+    g.btnPause = Add(PageStatus, Mk(L"BUTTON", L"Pause", btn, ox + pw - 72, by, 72, 26,
+                                    ID_BTN_PAUSE));
+    Add(PageStatus, Mk(L"STATIC", L"Recent activity:", SS_LEFT, ox, oy + 288, 200, 16,
+                       ID_LBL_LOG));
+    g.log = Add(PageStatus, Mk(L"EDIT", L"",
+                               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
+                               ox, oy + 306, pw, ph - 306, ID_LOG, WS_EX_CLIENTEDGE,
+                               g.fontMono));
 
-    Mk(L"STATIC", L"Check every", SS_LEFT, 12, 313, 76, 18, ID_LBL_INT);
-    g.interval = Mk(L"EDIT", L"10", ES_NUMBER | ES_RIGHT | WS_TABSTOP, 90, 309, 44, 24,
-                    ID_EDIT_INTERVAL, WS_EX_CLIENTEDGE);
+    // ---- Settings page (deliberately small)
+    int y = oy + 4;
+    Add(PageSettings, Mk(L"STATIC", L"Check the connection every", SS_LEFT,
+                         ox, y + 4, 170, 18, ID_LBL_INT));
+    g.interval = Add(PageSettings, Mk(L"EDIT", L"10", ES_NUMBER | ES_RIGHT | WS_TABSTOP,
+                                      ox + 174, y, 44, 24, ID_EDIT_INTERVAL, WS_EX_CLIENTEDGE));
     SendMessageW(g.interval, EM_LIMITTEXT, 4, 0);
-    Mk(L"STATIC", L"min", SS_LEFT, 140, 313, 30, 18, ID_LBL_MIN);
-    Mk(L"BUTTON", L"Apply", btn, 172, 308, 64, 26, ID_BTN_APPLY);
-    g.chkNotify = Mk(L"BUTTON", L"Show notifications", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     254, 310, 150, 22, ID_CHK_NOTIFY);
-    Mk(L"BUTTON", L"Open log folder", btn, 466, 308, 122, 26, ID_BTN_LOGDIR);
+    Add(PageSettings, Mk(L"STATIC", L"minutes", SS_LEFT, ox + 224, y + 4, 56, 18, ID_LBL_MIN));
+    Add(PageSettings, Mk(L"BUTTON", L"Apply", btn, ox + 286, y - 1, 64, 26, ID_BTN_APPLY));
+    y += 40;
+    g.chkNotify = Add(PageSettings, Mk(L"BUTTON",
+                                       L"Show tray notifications when the connection drops or comes back",
+                                       BS_AUTOCHECKBOX | WS_TABSTOP, ox, y, pw, 22, ID_CHK_NOTIFY));
+    y += 44;
+    Add(PageSettings, Mk(L"STATIC", L"Start with Windows", SS_LEFT, ox, y, pw, 18,
+                         ID_LBL_STARTUP, 0, g.fontBold));
+    g.startupState = Add(PageSettings, Mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX,
+                                          ox, y + 22, pw, 34, ID_STARTUP_STATE));
+    g.btnInstall = Add(PageSettings, Mk(L"BUTTON", L"Install at startup…", btn,
+                                        ox, y + 60, 150, 26, ID_BTN_INSTALL));
+    y += 104;
+    Add(PageSettings, Mk(L"STATIC", L"Settings and log", SS_LEFT, ox, y, pw, 18,
+                         ID_LBL_FILES, 0, g.fontBold));
+    Add(PageSettings, Mk(L"STATIC", DataDir().c_str(),
+                         SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS,
+                         ox, y + 26, pw - 124, 18, ID_FILES_PATH));
+    Add(PageSettings, Mk(L"BUTTON", L"Open folder", btn, ox + pw - 112, y + 21, 112, 26,
+                         ID_BTN_LOGDIR));
+    y += 66;
+    Add(PageSettings, Mk(L"STATIC", L"Uninstall", SS_LEFT, ox, y, pw, 18,
+                         ID_LBL_UNINST, 0, g.fontBold));
+    Add(PageSettings, Mk(L"STATIC",
+                         L"Stops the watchdog, removes the startup task and the installed copy. "
+                         L"Your settings and log folder are kept.",
+                         SS_LEFT | SS_NOPREFIX, ox, y + 22, pw, 34, ID_UNINST_INFO));
+    Add(PageSettings, Mk(L"BUTTON", L"Uninstall NetVigil…", btn, ox, y + 60, 150, 26,
+                         ID_BTN_UNINSTALL));
+    Add(PageSettings, Mk(L"STATIC",
+                         L"NetVigil · plain Win32, no dependencies · closing the window keeps it "
+                         L"running in the tray",
+                         SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
+                         ox, oy + ph - 18, pw, 18, ID_ABOUT));
 
-    Mk(L"STATIC", L"Recent activity:", SS_LEFT, 12, 342, 200, 16, ID_LBL_LOG);
-    g.log = Mk(L"EDIT", L"",
-               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
-               12, 360, 576, 108, ID_LOG, WS_EX_CLIENTEDGE, g.fontMono);
+    for (HWND h : g.pages[PageSettings]) ShowWindow(h, SW_HIDE);
+    // Children stack beneath earlier siblings, so the tab control (created
+    // first) would paint over the pages — send it to the bottom.
+    SetWindowPos(g.tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 // ---------------------------------------------------------------- handlers
@@ -440,12 +578,17 @@ void BuildControls()
 void OnCoreEvent(UiEvent ev, LPARAM lp)
 {
     switch (ev) {
-    case UiStateChanged:
-        UpdateStatus();
-        if (g.visible) RefreshNetworks();
+    case UiStateChanged: {
+        MonitorState st = GetMonitorState();
+        UpdateStatus(st);
+        // The network list only needs rebuilding after a completed check,
+        // not on every state tick during a repair.
+        if (g.visible && g.page == PageStatus && st.lastCheck != g.listedCheck)
+            RefreshNetworks();
         break;
+    }
     case UiLogAppended:
-        if (g.visible) AppendNewLog();
+        if (g.visible && g.page == PageStatus) AppendNewLog();
         break;
     case UiRestored:
         Balloon(L"Connection restored",
@@ -491,8 +634,7 @@ void OnCommand(int id)
     case ID_BTN_PAUSE:
     case TC_PAUSE:
         SetPaused(!GetMonitorState().paused);
-        SyncSettings();
-        UpdateStatus();
+        UpdateStatus(GetMonitorState());
         break;
     case ID_BTN_APPLY: {
         wchar_t buf[16] = {};
@@ -509,11 +651,36 @@ void OnCommand(int id)
     case ID_CHK_NOTIFY:
         SetNotifications(IsDlgButtonChecked(g.hwnd, ID_CHK_NOTIFY) == BST_CHECKED);
         break;
-    case ID_BTN_LOGDIR: {
-        std::wstring dir = LogPath();
-        size_t slash = dir.find_last_of(L'\\');
-        if (slash != std::wstring::npos) dir.resize(slash);
-        ShellExecuteW(g.hwnd, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    case ID_BTN_LOGDIR:
+        ShellExecuteW(g.hwnd, L"open", DataDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        break;
+    case ID_BTN_INSTALL:
+        if (!LaunchInstaller()) {
+            MessageBoxW(g.hwnd,
+                        L"The installer could not be started (elevation declined?). "
+                        L"See the log for details.",
+                        L"NetVigil", MB_ICONERROR | MB_OK);
+            break;
+        }
+        g.exitNote = L"Installing at startup — NetVigil will restart in the tray…";
+        UpdateStatus(GetMonitorState());
+        break;
+    case ID_BTN_UNINSTALL: {
+        int r = MessageBoxW(g.hwnd,
+                            L"Remove NetVigil from this computer?\n\n"
+                            L"This stops the watchdog, removes the startup task and the "
+                            L"installed copy. Your settings and log folder are kept.",
+                            L"Uninstall NetVigil", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+        if (r != IDYES) break;
+        if (!LaunchUninstaller()) {
+            MessageBoxW(g.hwnd,
+                        L"The uninstall helper could not be started (elevation declined?). "
+                        L"See the log for details.",
+                        L"NetVigil", MB_ICONERROR | MB_OK);
+            break;
+        }
+        g.exitNote = L"Uninstalling — NetVigil is closing…";
+        UpdateStatus(GetMonitorState());
         break;
     }
     case TC_OPEN:
@@ -521,7 +688,7 @@ void OnCommand(int id)
         break;
     case TC_EXIT:
         RequestStop();
-        UpdateStatus();
+        UpdateStatus(GetMonitorState());
         break;
     case IDCANCEL: // Escape
         HideMain();
@@ -537,7 +704,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (g.taskbarCreated && msg == g.taskbarCreated) { // explorer restarted
         AddTray();
-        UpdateStatus();
+        UpdateStatus(GetMonitorState());
         return 0;
     }
     switch (msg) {
@@ -564,7 +731,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_TIMER:
         if (wp == ID_TIMER_UI) {
-            UpdateStatus();
+            UpdateStatus(GetMonitorState());
         } else if (wp == ID_TIMER_RECHECK) {
             KillTimer(hwnd, ID_TIMER_RECHECK);
             RequestCheckNow();
@@ -575,14 +742,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_NOTIFY: {
         const NMHDR* h = (const NMHDR*)lp;
-        if (h->idFrom == ID_LIST && h->code == NM_DBLCLK) OnCommand(ID_BTN_CONNECT);
+        if (h->idFrom == ID_TABS && h->code == TCN_SELCHANGE)
+            ShowPage(TabCtrl_GetCurSel(g.tabs));
+        else if (h->idFrom == ID_LIST && h->code == NM_DBLCLK)
+            OnCommand(ID_BTN_CONNECT);
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
+        // Pages sit on the themed tab body, which is window-white.
         HDC dc = (HDC)wp;
         if ((HWND)lp == g.status) SetTextColor(dc, StatusColor(g.statusIcon));
-        SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
     case WM_CLOSE:
         HideMain();
@@ -608,7 +779,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 int RunGui(HINSTANCE hInst, bool startHidden)
 {
     g.hInst = hInst;
-    INITCOMMONCONTROLSEX icc{ sizeof icc, ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
+    INITCOMMONCONTROLSEX icc{ sizeof icc, ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES |
+                                          ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
     HDC dc = GetDC(nullptr);
     g.dpi = GetDeviceCaps(dc, LOGPIXELSX);
@@ -627,7 +799,7 @@ int RunGui(HINSTANCE hInst, bool startHidden)
     wc.hInstance = hInst;
     wc.lpszClassName = kWndClass;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.hIcon = g.icons[IconOnline];
     wc.hIconSm = g.icons[IconOnline];
     if (!RegisterClassExW(&wc)) {
@@ -659,7 +831,7 @@ int RunGui(HINSTANCE hInst, bool startHidden)
     }
     SetThreadPriority(g.worker, THREAD_PRIORITY_BELOW_NORMAL); // never fights the UI
 
-    if (startHidden) UpdateStatus();
+    if (startHidden) UpdateStatus(GetMonitorState());
     else             ShowMain();
 
     MSG msg;
@@ -676,6 +848,7 @@ int RunGui(HINSTANCE hInst, bool startHidden)
     CloseHandle(g.worker);
     for (HICON& i : g.icons) if (i) DestroyIcon(i);
     DeleteObject(g.font);
+    DeleteObject(g.fontBold);
     DeleteObject(g.fontBig);
     DeleteObject(g.fontMono);
     UnregisterClassW(kWndClass, hInst);

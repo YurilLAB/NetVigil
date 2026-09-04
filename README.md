@@ -70,8 +70,8 @@ NetVigil.exe --once          one check; remediate if offline; exit
 
 ## The window
 
-A single small window, plain Win32, nothing to install. **Closing it does not
-stop NetVigil** — the window hides and the watchdog keeps running in the tray;
+A single small window with two tabs (Status, Settings), plain Win32, nothing
+to install. **Closing it does not stop NetVigil** — the window hides and the watchdog keeps running in the tray;
 exit from the tray icon's menu. Launching `NetVigil.exe` again just brings the
 running instance's window back (even from a non-elevated shell). The tray icon
 is a coloured dot: green online, red offline, amber degraded / portal /
@@ -91,10 +91,22 @@ checking, grey paused.
   spot and verifies internet a few seconds later.
 - **Check now / Pause** — force a check, or pause the watchdog (e.g. while you
   deliberately work offline or sign into a captive portal).
-- **Check every N min / Apply** — change the interval live; it persists.
-- **Show notifications** — tray balloons when the connection is restored or a
-  repair fails.
 - **Recent activity** — the live tail of the log.
+
+The **Settings** tab is deliberately tiny:
+
+- **Check every N minutes** — change the interval live; it persists.
+- **Show tray notifications** — balloons when the connection drops or comes back.
+- **Start with Windows** — shows whether the logon task is installed, with an
+  *Install at startup* button (UAC prompt; NetVigil restarts hidden in the
+  tray). If you're running a newer build than the installed copy, the button
+  becomes *Update installed copy* — no need to touch the command line.
+- **Settings and log** — the data folder, with an *Open folder* button.
+- **Uninstall NetVigil** — stops the watchdog, removes the startup task and the
+  installed copy in `%ProgramFiles%\NetVigil`, then closes. Your settings and
+  log folder are kept (delete `%LOCALAPPDATA%\NetVigil` yourself for a clean
+  slate). If NetVigil is running *from* the installed copy, a helper copy in
+  `%TEMP%` performs the removal and deletes itself at the next reboot.
 
 Preferences and the remembered-network list live in
 `%LOCALAPPDATA%\NetVigil\netvigil.ini` (UTF-16, plain INI: `[settings]`,
@@ -107,7 +119,11 @@ The UI thread sleeps in `GetMessage`; the watchdog runs on a below-normal
 priority worker thread that waits on events between checks (no polling), and
 the process trims its working set before every idle interval. With the window
 hidden it sits at a few hundred KB and 0% CPU; the window is only refreshed
-while it is visible.
+while it is visible (the 1 s countdown timer runs only on the Status tab, the
+network list is rebuilt only after a completed check, and labels are not
+repainted when their text hasn't changed). The exe is built with whole-program
+optimization (`/GL` + `/LTCG /OPT:REF,ICF`), statically linked, no runtime
+dependencies.
 
 `--install` copies the exe to `%ProgramFiles%\NetVigil\` and points the
 scheduled task there — the task runs elevated at every logon, so it must never
