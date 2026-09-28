@@ -8,15 +8,19 @@
 // Exit (or Uninstall) stops the watchdog.
 
 #include "core.h"
+#include "diagnose.h"
 #include <commctrl.h>
 #include <shellapi.h>
+#include <objbase.h>
 #include <cstdio>
 #include <ctime>
+#include <cwctype>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 const wchar_t* const kWndClass = L"NetVigil.MainWindow";
@@ -36,14 +40,14 @@ const UINT_PTR ID_TIMER_UI = 1, ID_TIMER_RECHECK = 2;
 enum : int {
     ID_TABS = 100,
     // Status page
-    ID_STATUS, ID_DETAIL, ID_LBL_NETS, ID_LIST, ID_BTN_PREF, ID_BTN_ALLOW, ID_BTN_NEVER,
+    ID_STATUS, ID_DETAIL, ID_DIAG, ID_LBL_NETS, ID_LIST, ID_BTN_PREF, ID_BTN_ALLOW, ID_BTN_NEVER,
     ID_BTN_CONNECT, ID_BTN_CHECK, ID_BTN_PAUSE, ID_LBL_LOG, ID_LOG,
     // Settings page
-    ID_LBL_INT, ID_EDIT_INTERVAL, ID_LBL_MIN, ID_BTN_APPLY, ID_CHK_NOTIFY,
+    ID_LBL_INT, ID_EDIT_INTERVAL, ID_LBL_MIN, ID_BTN_APPLY, ID_CHK_NOTIFY, ID_CHK_FAILOVER,
     ID_LBL_STARTUP, ID_STARTUP_STATE, ID_BTN_INSTALL, ID_LBL_FILES, ID_FILES_PATH,
     ID_BTN_LOGDIR, ID_LBL_UNINST, ID_UNINST_INFO, ID_BTN_UNINSTALL, ID_ABOUT,
     // tray menu
-    TC_OPEN = 200, TC_CHECK, TC_PAUSE, TC_EXIT,
+    TC_OPEN = 200, TC_PORTAL, TC_CHECK, TC_PAUSE, TC_EXIT,
 };
 
 enum Page { PageStatus = 0, PageSettings = 1 };
@@ -51,9 +55,9 @@ enum IconKind { IconOnline, IconOffline, IconWarn, IconPaused, IconCount };
 
 struct Gui {
     HINSTANCE hInst = nullptr;
-    HWND hwnd = nullptr, tabs = nullptr, status = nullptr, detail = nullptr,
+    HWND hwnd = nullptr, tabs = nullptr, status = nullptr, detail = nullptr, diag = nullptr,
          list = nullptr, log = nullptr, interval = nullptr, chkNotify = nullptr,
-         btnPause = nullptr, startupState = nullptr, btnInstall = nullptr;
+         chkFailover = nullptr, btnPause = nullptr, startupState = nullptr, btnInstall = nullptr;
     std::vector<HWND> pages[2];
     int page = PageStatus;
     HFONT font = nullptr, fontBold = nullptr, fontBig = nullptr, fontMono = nullptr;
@@ -69,6 +73,7 @@ struct Gui {
     std::vector<KnownNetwork> rows;
     int dpi = 96;
     bool visible = false, trayAdded = false, hideHintShown = false;
+    bool balloonIsPortal = false;     // clicking the current balloon opens the sign-in page
 } g;
 
 int S(int v) { return MulDiv(v, g.dpi, 96); }
@@ -184,6 +189,15 @@ std::wstring TimeStr(long long unix)
     return buf;
 }
 
+// "the router answers" -> "The router answers."
+std::wstring Sentence(std::wstring s)
+{
+    if (s.empty()) return s;
+    s[0] = (wchar_t)towupper(s[0]);
+    if (s.back() != L'.') s += L'.';
+    return s;
+}
+
 const wchar_t* ModeText(NetMode m)
 {
     switch (m) {
@@ -234,24 +248,42 @@ void SetTray(IconKind k, const std::wstring& tip)
     Shell_NotifyIconW(NIM_MODIFY, &g.nid);
 }
 
-void Balloon(const std::wstring& title, const std::wstring& text, bool force = false)
+void Balloon(const std::wstring& title, const std::wstring& text, bool force = false,
+             DWORD icon = NIIF_INFO, bool portal = false)
 {
     if (!g.trayAdded || (!force && !GetNotifications())) return;
+    g.balloonIsPortal = portal;
     g.nid.uFlags = NIF_INFO;
     wcsncpy_s(g.nid.szInfoTitle, title.c_str(), _TRUNCATE);
     wcsncpy_s(g.nid.szInfo, text.c_str(), _TRUNCATE);
-    g.nid.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    g.nid.dwInfoFlags = icon | NIIF_RESPECT_QUIET_TIME;
     Shell_NotifyIconW(NIM_MODIFY, &g.nid);
+}
+
+// The network's sign-in page, opened through Explorer so the browser does
+// not inherit the watchdog's admin rights.
+void OpenPortal()
+{
+    wchar_t win[MAX_PATH] = {};
+    GetWindowsDirectoryW(win, MAX_PATH);
+    std::wstring explorer = std::wstring(win) + L"\\explorer.exe";
+    std::wstring arg = std::wstring(L"\"") + kPortalUrl + L"\"";
+    if ((INT_PTR)ShellExecuteW(g.hwnd, L"open", explorer.c_str(), arg.c_str(), nullptr,
+                               SW_SHOWNORMAL) <= 32)
+        ShellExecuteW(g.hwnd, L"open", kPortalUrl, nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void TrayMenu()
 {
     HMENU m = CreatePopupMenu();
     if (!m) return;
+    MonitorState st = GetMonitorState();
     AppendMenuW(m, MF_STRING, TC_OPEN, L"Open NetVigil");
+    if (st.status == Net::Portal || st.fault == (int)nv::Fault::CaptivePortal)
+        AppendMenuW(m, MF_STRING, TC_PORTAL, L"Open the network sign-in page");
     AppendMenuW(m, MF_STRING, TC_CHECK, L"Check connection now");
     AppendMenuW(m, MF_STRING, TC_PAUSE,
-                GetMonitorState().paused ? L"Resume monitoring" : L"Pause monitoring");
+                st.paused ? L"Resume monitoring" : L"Pause monitoring");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, TC_EXIT, L"Exit (stop the watchdog)");
     SetMenuDefaultItem(m, TC_OPEN, FALSE);
@@ -332,25 +364,54 @@ void SyncSettings()
 {
     SetTextIfChanged(g.interval, std::to_wstring(GetIntervalMin()));
     CheckDlgButton(g.hwnd, ID_CHK_NOTIFY, GetNotifications() ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(g.hwnd, ID_CHK_FAILOVER, GetFailover() ? BST_CHECKED : BST_UNCHECKED);
 }
 
-// Spawns schtasks, so only called when the Settings page is shown.
+// Asks Task Scheduler, so only called when the Settings page is shown.
 void SyncStartupState()
 {
-    bool installed = IsInstalledAtStartup();
-    bool thisCopy  = IsRunningInstalledCopy();
-    SetTextIfChanged(g.startupState, installed
-        ? (thisCopy
-            ? L"Installed — NetVigil starts hidden in the tray at logon, elevated so it "
-              L"can reset the Wi-Fi driver."
-            : L"Installed — but this window is a different build than the installed "
-              L"copy. Update it to run this version at logon.")
-        : L"Not installed — NetVigil only runs while you start it yourself, and "
-          L"without elevation it cannot reset the driver.");
-    SetTextIfChanged(g.btnInstall, !installed ? L"Install at startup…"
-                                  : thisCopy  ? L"Installed at startup"
-                                              : L"Update installed copy…");
-    EnableWindow(g.btnInstall, !installed || !thisCopy);
+    StartupStatus s = GetStartupStatus();
+    std::wstring text;
+    const wchar_t* button = L"Install at startup…";
+    bool enable = true;
+    switch (s.state) {
+    case StartupState::Installed:
+        text = L"Installed — NetVigil starts hidden in the tray when you sign in (with admin "
+               L"rights, also on battery) and is relaunched if it ever stops.";
+        button = L"Installed at startup";
+        enable = false;
+        break;
+    case StartupState::OtherCopy:
+        text = L"Installed — but this window is a different build than the installed copy. "
+               L"Update it to run this version at sign-in.";
+        button = L"Update installed copy…";
+        break;
+    case StartupState::Outdated:
+        text = L"Installed with an older startup task, which Windows stops after 3 days and "
+               L"does not start on battery power. Repair it.";
+        button = L"Repair startup task…";
+        break;
+    case StartupState::Disabled:
+        text = L"Installed, but the startup task is disabled in Task Scheduler, so NetVigil "
+               L"does not start at sign-in.";
+        button = L"Re-enable at startup…";
+        break;
+    case StartupState::Broken:
+        text = L"The startup task points at a file that no longer exists (" + s.detail +
+               L"). Reinstall it.";
+        button = L"Reinstall at startup…";
+        break;
+    case StartupState::NotInstalled:
+        text = L"Not installed — NetVigil only runs while you start it yourself, and without "
+               L"admin rights it cannot reset adapters or repair network settings.";
+        break;
+    default:
+        text = L"Cannot read the startup task: " + s.detail;
+        break;
+    }
+    SetTextIfChanged(g.startupState, text);
+    SetTextIfChanged(g.btnInstall, button);
+    EnableWindow(g.btnInstall, enable);
 }
 
 void UpdateStatus(const MonitorState& st)
@@ -370,11 +431,19 @@ void UpdateStatus(const MonitorState& st)
         head = L"Checking the connection…";
     } else {
         switch (st.status) {
-        case Net::Online:   head = L"Online"; ic = IconOnline; break;
-        case Net::Degraded: head = L"Degraded — pings work, HTTP/DNS failing"; break;
+        case Net::Online:
+            head = st.diagnosis.empty() ? L"Online" : L"Online — " + st.diagnosis;
+            ic = st.diagnosis.empty() ? IconOnline : IconWarn;
+            break;
+        case Net::Degraded:
+            head = L"Degraded — " + (st.diagnosis.empty() ? std::wstring(L"web or DNS failing")
+                                                          : st.diagnosis);
+            break;
         case Net::Portal:   head = L"Captive portal — sign in via your browser"; break;
         default:
-            head = st.remediating ? L"Offline — " + st.lastAction : L"Offline";
+            head = st.remediating       ? L"Offline — " + st.lastAction
+                 : !st.diagnosis.empty() ? L"Offline — " + st.diagnosis
+                                         : std::wstring(L"Offline");
             ic = IconOffline;
             break;
         }
@@ -400,8 +469,18 @@ void UpdateStatus(const MonitorState& st)
             det += (det.empty() ? L"" : L"  ·  ") +
                    std::wstring(L"not elevated: driver reset unavailable (see Settings)");
     }
+    // Why it is down (or what fixed it last time).
+    std::wstring diag;
+    if (!st.paused && !st.diagnosisDetail.empty()) {
+        diag = L"Diagnosis: " + Sentence(st.diagnosisDetail);
+    } else if (!st.lastRepair.empty() && st.lastRepairAt > 0) {
+        long long ago = (long long)_time64(nullptr) - st.lastRepairAt;
+        diag = L"Last repair: " + st.lastRepair + L", " +
+               (ago < 60 ? std::wstring(L"just now") : nv::DurationText(ago) + L" ago");
+    }
     SetTextIfChanged(g.status, head);
     SetTextIfChanged(g.detail, det);
+    SetTextIfChanged(g.diag, diag);
     SetTextIfChanged(g.btnPause, st.paused ? L"Resume" : L"Pause");
     if (ic != g.statusIcon) {
         g.statusIcon = ic;
@@ -492,12 +571,14 @@ void BuildControls()
                                   ox, oy, pw, 26, ID_STATUS, 0, g.fontBig));
     g.detail = Add(PageStatus, Mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
                                   ox, oy + 30, pw, 18, ID_DETAIL));
+    g.diag = Add(PageStatus, Mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX,   // wraps: 2 lines
+                                ox, oy + 50, pw, 32, ID_DIAG));
     Add(PageStatus, Mk(L"STATIC", L"Networks — choose what NetVigil auto-connects to:",
-                       SS_LEFT | SS_NOPREFIX, ox, oy + 56, pw, 16, ID_LBL_NETS));
+                       SS_LEFT | SS_NOPREFIX, ox, oy + 86, pw, 16, ID_LBL_NETS));
     g.list = Add(PageStatus, Mk(WC_LISTVIEWW, L"",
                                 LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS |
                                 LVS_NOSORTHEADER | WS_TABSTOP,
-                                ox, oy + 74, pw, 170, ID_LIST, WS_EX_CLIENTEDGE));
+                                ox, oy + 104, pw, 140, ID_LIST, WS_EX_CLIENTEDGE));
     ListView_SetExtendedListViewStyle(g.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     const struct { const wchar_t* name; int width; } cols[] = {
         { L"Network", 208 }, { L"Auto-connect", 96 }, { L"Signal", 92 }, { L"Last connected", 150 },
@@ -537,6 +618,11 @@ void BuildControls()
     g.chkNotify = Add(PageSettings, Mk(L"BUTTON",
                                        L"Show tray notifications when the connection drops or comes back",
                                        BS_AUTOCHECKBOX | WS_TABSTOP, ox, y, pw, 22, ID_CHK_NOTIFY));
+    y += 26;
+    g.chkFailover = Add(PageSettings, Mk(L"BUTTON",
+                                         L"During an ISP outage, switch to another saved Wi-Fi network "
+                                         L"that has internet",
+                                         BS_AUTOCHECKBOX | WS_TABSTOP, ox, y, pw, 22, ID_CHK_FAILOVER));
     y += 44;
     Add(PageSettings, Mk(L"STATIC", L"Start with Windows", SS_LEFT, ox, y, pw, 18,
                          ID_LBL_STARTUP, 0, g.fontBold));
@@ -597,10 +683,22 @@ void OnCoreEvent(UiEvent ev, LPARAM lp)
                    : L"Back online.");
         break;
     case UiFailed:
-        if (lp == 1)
+        // A specific diagnosis the user has to act on was already announced.
+        if (lp == 1 && !GetMonitorState().faultNeedsUser)
             Balloon(L"Connection is down",
                     L"NetVigil could not restore it yet — retrying every 2 minutes.");
         break;
+    case UiAdvice: {
+        MonitorState st = GetMonitorState();
+        if (lp == (LPARAM)nv::Fault::CaptivePortal)
+            Balloon(L"Sign in to the network",
+                    L"This network shows a sign-in page before it lets you online. "
+                    L"Click here to open it.", false, NIIF_INFO, true);
+        else if (!st.diagnosisDetail.empty())
+            Balloon(nv::FaultName((nv::Fault)lp), Sentence(st.diagnosisDetail), false,
+                    NIIF_WARNING);
+        break;
+    }
     case UiStopped:
         DestroyWindow(g.hwnd);
         break;
@@ -651,6 +749,12 @@ void OnCommand(int id)
     case ID_CHK_NOTIFY:
         SetNotifications(IsDlgButtonChecked(g.hwnd, ID_CHK_NOTIFY) == BST_CHECKED);
         break;
+    case ID_CHK_FAILOVER:
+        SetFailover(IsDlgButtonChecked(g.hwnd, ID_CHK_FAILOVER) == BST_CHECKED);
+        break;
+    case TC_PORTAL:
+        OpenPortal();
+        break;
     case ID_BTN_LOGDIR:
         ShellExecuteW(g.hwnd, L"open", DataDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         break;
@@ -687,7 +791,7 @@ void OnCommand(int id)
         ShowMain();
         break;
     case TC_EXIT:
-        RequestStop();
+        RequestStop(/*byUser=*/true); // stays stopped until the next sign-in
         UpdateStatus(GetMonitorState());
         break;
     case IDCANCEL: // Escape
@@ -720,12 +824,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_LBUTTONDBLCLK:
             ShowMain();
             break;
+        case NIN_BALLOONUSERCLICK:
+            if (g.balloonIsPortal) OpenPortal();
+            else ShowMain();
+            break;
         case WM_CONTEXTMENU:
         case WM_RBUTTONUP:
             TrayMenu();
             break;
         }
         return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC) NotifyResumed(); // Wi-Fi often fails to return
+        return TRUE;
     case WM_CORE:
         OnCoreEvent((UiEvent)wp, lp);
         return 0;
@@ -779,6 +890,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 int RunGui(HINSTANCE hInst, bool startHidden)
 {
     g.hInst = hInst;
+    HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     INITCOMMONCONTROLSEX icc{ sizeof icc, ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES |
                                           ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
@@ -852,5 +964,6 @@ int RunGui(HINSTANCE hInst, bool startHidden)
     DeleteObject(g.fontBig);
     DeleteObject(g.fontMono);
     UnregisterClassW(kWndClass, hInst);
+    if (SUCCEEDED(com)) CoUninitialize();
     return (int)msg.wParam;
 }

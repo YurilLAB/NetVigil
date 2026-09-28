@@ -43,26 +43,52 @@ struct MonitorState {
     ULONGLONG nextCheck = 0;
     ULONGLONG offlineSince = 0;
     int failStreak = 0;
+    // Latest diagnosis (nv::Fault as int; 0 = none / healthy).
+    int fault = 0;
+    bool faultNeedsUser = false; // only the user can finish this fix
+    std::wstring diagnosis;      // short fault name, "ISP / router outage"
+    std::wstring diagnosisDetail;// one-line explanation
+    std::wstring lastRepair;     // what fixed the last outage
+    long long lastRepairAt = 0;  // unix seconds
+    int windowsLevel = -1;       // Windows' own connectivity hint, -1 = unknown
 };
 
 MonitorState GetMonitorState();
 void RequestCheckNow();
+void NotifyResumed();                     // the machine woke from sleep
 void SetPaused(bool paused);
-void RequestStop();
+void RequestStop(bool byUser = false);    // byUser: don't auto-relaunch this session
 
 DWORD GetIntervalMin();
 void  SetIntervalMin(DWORD minutes);
 bool  GetNotifications();
 void  SetNotifications(bool on);
+bool  GetFailover();                      // may switch Wi-Fi networks in an ISP outage
+void  SetFailover(bool on);
 
 std::vector<KnownNetwork> GetKnownNetworks();
 void SetNetworkMode(const std::wstring& profile, NetMode mode);
 bool ConnectToNetwork(const std::wstring& profile);
 
+// Windows' own captive-portal trigger: opens the network's sign-in page.
+extern const wchar_t* const kPortalUrl;
+
 // Startup integration (Settings page). Both launchers hand the work to an
 // elevated helper process which stops THIS instance as part of the job.
-bool IsInstalledAtStartup();
-bool IsRunningInstalledCopy();            // this exe IS %ProgramFiles%\NetVigil\NetVigil.exe
+enum class StartupState {
+    NotInstalled,
+    Installed,                // this exe is the installed copy the task runs
+    OtherCopy,                // task runs a different build than this window
+    Disabled,                 // task switched off in Task Scheduler
+    Outdated,                 // pre-format-2 task (72 h limit, no battery start)
+    Broken,                   // task points at a missing file
+    Unknown,                  // Task Scheduler could not be asked
+};
+struct StartupStatus {
+    StartupState state = StartupState::Unknown;
+    std::wstring detail;
+};
+StartupStatus GetStartupStatus();
 bool LaunchInstaller();
 bool LaunchUninstaller();
 const std::wstring& DataDir();            // %LOCALAPPDATA%\NetVigil
@@ -71,7 +97,9 @@ const std::wstring& DataDir();            // %LOCALAPPDATA%\NetVigil
 std::vector<std::wstring> GetLogSince(unsigned long long& seq);
 
 // The worker posts `msg` to `hwnd` with one of these in wParam.
-enum UiEvent : WPARAM { UiStateChanged = 1, UiLogAppended, UiRestored, UiFailed, UiStopped };
+// UiAdvice: lParam = nv::Fault the user should hear about (see MonitorState).
+enum UiEvent : WPARAM { UiStateChanged = 1, UiLogAppended, UiRestored, UiFailed, UiStopped,
+                        UiAdvice };
 void SetUiNotify(HWND hwnd, UINT msg);
 
 DWORD WINAPI MonitorThreadProc(LPVOID);

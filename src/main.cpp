@@ -1,16 +1,22 @@
-// NetVigil — Wi-Fi connectivity watchdog for Windows.
+// NetVigil — connectivity watchdog for Windows.
 //
 // Runs at logon (scheduled task), probes internet connectivity on an interval
-// (default 10 min) and, when the connection is confirmed down, escalates:
-//   stage 1: rejoin Wi-Fi (radio on, scan, connect best remembered network)
-//   stage 2: reset the Wi-Fi adapter driver (disable/enable via SetupAPI),
-//            restart WlanSvc if that yields nothing, then reconnect again.
-// Works with any WLAN interface Windows knows about, including external
-// USB adapters — interfaces are re-enumerated on every cycle, and if an
-// adapter has wedged so hard it vanished from WlanSvc, a heuristic pass
-// resets present wireless-looking net devices instead.
+// (default 10 min; at once when Windows reports a connectivity change or the
+// machine wakes) and, when the connection is confirmed down, works out WHY
+// before touching anything:
+//   observe   adapters, driver state, Wi-Fi radio and association, services,
+//             routing, gateway reachability, DNS, proxy, clock
+//   diagnose  nv::Diagnose (diagnose.cpp) names the fault and orders the
+//             repairs cheapest-first — heavy ones (driver reset, WlanSvc
+//             restart) only for faults they can actually fix
+//   repair    every step is verified; the situation is re-diagnosed when a
+//             plan runs out
+// Works with internal and USB Wi-Fi as well as wired adapters; interfaces
+// and devices are re-enumerated on every cycle.
 
 #include "core.h"
+#include "diagnose.h"
+#include "startup.h"
 #include <ws2tcpip.h>
 #include <objbase.h>
 #include <initguid.h>
@@ -20,18 +26,26 @@
 #include <iphlpapi.h>
 #include <icmpapi.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
+#include <windns.h>
 #include <shellapi.h>
 #include <sddl.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <ctime>
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <deque>
+#include <memory>
+#include <atomic>
+#include <functional>
 #include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -39,20 +53,29 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "dnsapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ole32.lib")
+
+bool DisableManualProxy(std::wstring* previous); // proxy.cpp
 
 // ---------------------------------------------------------------- constants
 
 static const wchar_t* kTaskName      = L"NetVigil";
 static const wchar_t* kMutexName     = L"Local\\NetVigil.single";
 static const wchar_t* kStopEventName = L"Local\\NetVigil.stop";
+const wchar_t* const  kPortalUrl     = L"http://www.msftconnecttest.com/redirect";
+static const char*    kDnsProbeHost  = "www.msftconnecttest.com";
 
 static const DWORD     kDefaultIntervalMin = 10;   // normal check cadence
 static const DWORD     kOfflineRetryMin    = 2;    // cadence while still down
+static const DWORD     kRelaunchMin        = 10;   // task repetition that restarts a dead watchdog
 static const ULONGLONG kResetCooldownMs    = 15ull * 60 * 1000; // between driver resets
+static const ULONGLONG kAuthFailWindowMs   = 30ull * 60 * 1000; // skip a rejected profile this long
+static const long long kWifiMemorySec      = 7ll * 86400;       // a vanished Wi-Fi adapter counts as missing
 static const ULONGLONG kLogRotateBytes     = 1ull << 20;        // 1 MiB
 
 // ---------------------------------------------------------------- globals
@@ -62,10 +85,14 @@ static std::wstring g_iniPath;
 static std::wstring g_dataDir;
 static bool         g_elevated  = false;
 static bool         g_helper    = false;     // --helper: temp copy running an uninstall
+static bool         g_wsaOk     = false;
 static HANDLE       g_stopEvent = nullptr;   // manual-reset, named: "exit"
 static HANDLE       g_wakeEvent = nullptr;   // auto-reset: "check now"
+static HANDLE       g_hintEvent = nullptr;   // auto-reset: Windows' connectivity level changed
+static volatile LONG g_hintLevel = -1;       // NL_NETWORK_CONNECTIVITY_LEVEL_HINT, -1 = unknown
+static volatile LONG g_resumed   = 0;        // set by NotifyResumed()
 
-static CRITICAL_SECTION g_logCs, g_stateCs, g_cfgCs;
+static CRITICAL_SECTION g_logCs, g_stateCs, g_cfgCs, g_wlanCs;
 static std::deque<std::wstring> g_logRing;   // tail shown in the GUI
 static unsigned long long g_logSeq = 0;      // lines ever logged
 static const size_t kLogRingMax = 400;
@@ -74,6 +101,7 @@ static MonitorState g_state;
 static volatile LONG g_paused      = 0;
 static volatile LONG g_intervalMin = (LONG)kDefaultIntervalMin;
 static volatile LONG g_notify      = 1;
+static volatile LONG g_failover    = 1;
 static HWND g_uiHwnd = nullptr;
 static UINT g_uiMsg  = 0;
 
@@ -158,7 +186,7 @@ static void AppendLogFile(const std::string& bytes)
     CloseHandle(h);
 }
 
-// Called from both the worker and the UI thread.
+// Called from the worker, the UI thread and WLAN/helper threads.
 static void LogLine(const std::wstring& msg)
 {
     SYSTEMTIME st;
@@ -211,7 +239,9 @@ static void InitCore()
     InitializeCriticalSection(&g_logCs);
     InitializeCriticalSection(&g_stateCs);
     InitializeCriticalSection(&g_cfgCs);
+    InitializeCriticalSection(&g_wlanCs);
     g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_hintEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
 
 static void InitLog()
@@ -244,14 +274,18 @@ static void BindConsole()
     }
 }
 
+static bool TokenIsElevated(HANDLE tok)
+{
+    TOKEN_ELEVATION el{};
+    DWORD n = 0;
+    return GetTokenInformation(tok, TokenElevation, &el, sizeof el, &n) && el.TokenIsElevated;
+}
+
 static bool IsElevated()
 {
     HANDLE tok = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
-    TOKEN_ELEVATION el{};
-    DWORD n = 0;
-    bool ok = GetTokenInformation(tok, TokenElevation, &el, sizeof el, &n) &&
-              el.TokenIsElevated;
+    bool ok = TokenIsElevated(tok);
     CloseHandle(tok);
     return ok;
 }
@@ -288,6 +322,31 @@ static bool WaitStop(DWORD ms)
 static bool StopRequested()
 {
     return g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0;
+}
+
+// Runs fn on a helper thread and waits at most `ms`. A wedged driver can
+// block SetupAPI, WLAN or resolver calls indefinitely; on timeout the helper
+// is abandoned (fn must own everything it touches — capture by value or
+// shared_ptr) and the watchdog carries on instead of hanging with it.
+static DWORD WINAPI BoundedThunk(LPVOID p)
+{
+    std::unique_ptr<std::function<void()>> fn(static_cast<std::function<void()>*>(p));
+    (*fn)();
+    return 0;
+}
+
+static bool RunBounded(DWORD ms, std::function<void()> fn)
+{
+    auto* job = new std::function<void()>(std::move(fn));
+    HANDLE t = CreateThread(nullptr, 0, BoundedThunk, job, 0, nullptr);
+    if (!t) {                       // no thread to spare: run it inline
+        (*job)();
+        delete job;
+        return true;
+    }
+    bool done = WaitForSingleObject(t, ms) == WAIT_OBJECT_0;
+    CloseHandle(t);
+    return done;
 }
 
 // The monitor usually runs elevated (scheduled task) while --stop or a second
@@ -384,11 +443,46 @@ struct ScopedIcmp {                   // IcmpCloseHandle
     ~ScopedIcmp() { if (h != INVALID_HANDLE_VALUE) IcmpCloseHandle(h); }
 };
 
+struct ScopedSocket {                 // closesocket
+    SOCKET s = INVALID_SOCKET;
+    explicit ScopedSocket(SOCKET v) : s(v) {}
+    ScopedSocket(const ScopedSocket&) = delete;
+    ScopedSocket& operator=(const ScopedSocket&) = delete;
+    ~ScopedSocket() { if (s != INVALID_SOCKET) closesocket(s); }
+    bool valid() const { return s != INVALID_SOCKET; }
+};
+
 static void TrimWorkingSet()
 {
     // Long-lived background process about to idle for minutes: hand unneeded
     // pages back to the OS (they page back in on demand).
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
+
+static bool RegReadDword(HKEY root, const std::wstring& path, const wchar_t* value, DWORD& out)
+{
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
+    ScopedRegKey guard(k);
+    DWORD v = 0, sz = sizeof v, type = 0;
+    if (RegQueryValueExW(k, value, nullptr, &type, (BYTE*)&v, &sz) != ERROR_SUCCESS ||
+        type != REG_DWORD)
+        return false;
+    out = v;
+    return true;
+}
+
+static std::wstring RegReadString(HKEY root, const std::wstring& path, const wchar_t* value)
+{
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return L"";
+    ScopedRegKey guard(k);
+    wchar_t buf[512] = {};
+    DWORD sz = sizeof buf - sizeof(wchar_t), type = 0;
+    if (RegQueryValueExW(k, value, nullptr, &type, (BYTE*)buf, &sz) != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_MULTI_SZ && type != REG_EXPAND_SZ))
+        return L"";
+    return buf;
 }
 
 // ---------------------------------------------------------------- monitor state
@@ -421,6 +515,12 @@ void RequestCheckNow()
     if (g_wakeEvent) SetEvent(g_wakeEvent);
 }
 
+void NotifyResumed()
+{
+    InterlockedExchange(&g_resumed, 1);
+    RequestCheckNow();
+}
+
 void SetPaused(bool paused)
 {
     InterlockedExchange(&g_paused, paused ? 1 : 0);
@@ -429,8 +529,11 @@ void SetPaused(bool paused)
     RequestCheckNow(); // wake the worker so it notices either way
 }
 
-void RequestStop()
+static void MarkUserExit(); // fwd (config)
+
+void RequestStop(bool byUser)
 {
+    if (byUser) MarkUserExit();
     if (g_stopEvent) SetEvent(g_stopEvent);
     UpdateState([](MonitorState& s) { s.stopping = true; });
 }
@@ -438,9 +541,12 @@ void RequestStop()
 // ---------------------------------------------------------------- config (ini)
 //
 // %LOCALAPPDATA%\NetVigil\netvigil.ini
-//   [settings]  interval=10  notifications=1
+//   [settings]  interval=10  notifications=1  failover=1  wifiSeen=<unix>
+//               exitedLogon=<logon stamp>  disabledProxy=<server>
 //   [networks]  <profile>=preferred|never        (absent = allowed)
 //   [seen]      <profile>=<unix-time>|<connects>|<ssid>
+//   [repairs]   <repair>=<times it brought the connection back>
+//   [resets]    <adapter guid>=<driver resets that revived it>
 
 struct SeenInfo {
     long long lastSeen = 0;
@@ -505,7 +611,15 @@ static std::vector<std::pair<std::wstring, std::wstring>> ReadIniSection(const w
 
 static void SaveSetting(const wchar_t* key, const std::wstring& value)
 {
+    EnsureUnicodeIni();
     WritePrivateProfileStringW(L"settings", key, value.c_str(), g_iniPath.c_str());
+}
+
+static long long ReadSettingInt64(const wchar_t* key)
+{
+    wchar_t buf[32] = {};
+    GetPrivateProfileStringW(L"settings", key, L"", buf, 32, g_iniPath.c_str());
+    return _wtoi64(buf);
 }
 
 static void LoadConfig(DWORD intervalArg)
@@ -515,6 +629,8 @@ static void LoadConfig(DWORD intervalArg)
     InterlockedExchange(&g_intervalMin, (iv >= 1 && iv <= 1440) ? (LONG)iv : (LONG)intervalArg);
     InterlockedExchange(&g_notify,
         GetPrivateProfileIntW(L"settings", L"notifications", 1, g_iniPath.c_str()) ? 1 : 0);
+    InterlockedExchange(&g_failover,
+        GetPrivateProfileIntW(L"settings", L"failover", 1, g_iniPath.c_str()) ? 1 : 0);
 
     EnterCriticalSection(&g_cfgCs);
     for (const auto& kv : ReadIniSection(L"networks"))
@@ -625,13 +741,83 @@ void SetNotifications(bool on)
     SaveSetting(L"notifications", on ? L"1" : L"0");
 }
 
+bool GetFailover() { return g_failover != 0; }
+
+void SetFailover(bool on)
+{
+    InterlockedExchange(&g_failover, on ? 1 : 0);
+    SaveSetting(L"failover", on ? L"1" : L"0");
+    Logf(on ? L"ISP-outage failover to other saved networks enabled"
+            : L"ISP-outage failover to other saved networks disabled");
+}
+
+// "Exit" from the tray (or --stop) means: stay stopped until the next
+// sign-in — the startup task's relaunch trigger checks this marker.
+static void MarkUserExit()
+{
+    long long stamp = SessionLogonStamp();
+    if (stamp) SaveSetting(L"exitedLogon", std::to_wstring(stamp));
+}
+
+static void ClearUserExit()
+{
+    WritePrivateProfileStringW(L"settings", L"exitedLogon", nullptr, g_iniPath.c_str());
+}
+
+static bool UserExitedThisSession()
+{
+    long long stamp = SessionLogonStamp();
+    return stamp != 0 && ReadSettingInt64(L"exitedLogon") == stamp;
+}
+
+// Wi-Fi hardware memory, so a USB dongle that dropped off the bus is
+// recognised as missing rather than as "no Wi-Fi on this machine".
+static void RememberWifiSeen()
+{
+    static long long lastSaved = 0;
+    long long now = (long long)_time64(nullptr);
+    if (now - lastSaved < 3600) return;
+    lastSaved = now;
+    SaveSetting(L"wifiSeen", std::to_wstring(now));
+}
+
+static bool WifiSeenRecently()
+{
+    long long seen = ReadSettingInt64(L"wifiSeen");
+    return seen > 0 && (long long)_time64(nullptr) - seen < kWifiMemorySec;
+}
+
+static int IniCount(const wchar_t* section, const std::wstring& key)
+{
+    return (int)GetPrivateProfileIntW(section, key.c_str(), 0, g_iniPath.c_str());
+}
+
+static void IniBump(const wchar_t* section, const std::wstring& key)
+{
+    if (!IniSafeKey(key)) return;
+    EnsureUnicodeIni();
+    WritePrivateProfileStringW(section, key.c_str(),
+                               std::to_wstring(IniCount(section, key) + 1).c_str(),
+                               g_iniPath.c_str());
+}
+
+static std::wstring RepairStats()
+{
+    std::wstring s;
+    for (const auto& kv : ReadIniSection(L"repairs")) {
+        if (!s.empty()) s += L", ";
+        s += kv.first + L" ×" + kv.second;
+    }
+    return s;
+}
+
 // ---------------------------------------------------------------- probes
 
 const wchar_t* NetToStr(Net n)
 {
     switch (n) {
     case Net::Online:   return L"ONLINE";
-    case Net::Degraded: return L"DEGRADED (ICMP ok, HTTP/DNS failing)";
+    case Net::Degraded: return L"DEGRADED (internet reachable by IP, web/DNS failing)";
     case Net::Portal:   return L"CAPTIVE PORTAL / FILTERED";
     default:            return L"OFFLINE";
     }
@@ -640,28 +826,60 @@ const wchar_t* NetToStr(Net n)
 struct ProbeResult {
     bool ok = false;          // endpoint returned the expected content
     bool gotResponse = false; // some HTTP response arrived (portal suspect)
+    bool dateKnown = false;   // server sent a usable Date header
+    long long skewSec = 0;    // local clock minus server clock
 };
 
-// One WinHTTP session for the whole process — proxy discovery and session
-// setup are not redone for every probe. The OS reclaims it at exit.
+// One WinHTTP session for the probes — proxy discovery and session setup are
+// not redone every check. Reset after NetVigil changes the proxy settings.
+static HINTERNET g_httpSession = nullptr;
+
 static HINTERNET HttpSession()
 {
-    static HINTERNET ses = nullptr;
     static bool warned = false;
-    if (!ses) {
-        ses = WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!ses)
-            ses = WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (ses)
-            WinHttpSetTimeouts(ses, 5000, 5000, 5000, 5000);
+    if (!g_httpSession) {
+        g_httpSession = WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!g_httpSession)
+            g_httpSession = WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (g_httpSession)
+            WinHttpSetTimeouts(g_httpSession, 5000, 5000, 5000, 5000);
         else if (!warned) {
             warned = true;
             Logf(L"WinHttpOpen failed (%u) — HTTP probes unavailable", GetLastError());
         }
     }
-    return ses;
+    return g_httpSession;
+}
+
+static void ResetHttpSession()
+{
+    if (g_httpSession) WinHttpCloseHandle(g_httpSession);
+    g_httpSession = nullptr;
+}
+
+// Server time from the Date header (plus Age, for a cached answer).
+static void ReadServerClock(HINTERNET req, ProbeResult& r)
+{
+    SYSTEMTIME st{};
+    DWORD len = sizeof st;
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &st, &len, WINHTTP_NO_HEADER_INDEX))
+        return;
+    FILETIME ft{};
+    if (!SystemTimeToFileTime(&st, &ft)) return;
+    ULARGE_INTEGER u{};
+    u.LowPart  = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    DWORD age = 0;
+    len = sizeof age;
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_AGE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &age, &len, WINHTTP_NO_HEADER_INDEX))
+        age = 0;
+    long long serverMs = (long long)(u.QuadPart / 10000ull) + (long long)age * 1000;
+    r.dateKnown = true;
+    r.skewSec = ((long long)WallMs() - serverMs) / 1000;
 }
 
 static ProbeResult HttpProbe(const wchar_t* host, const wchar_t* path,
@@ -700,66 +918,129 @@ static ProbeResult HttpProbe(const wchar_t* host, const wchar_t* path,
         if (WinHttpReadData(req.h, body, sizeof body - 1, &rd))
             r.ok = strncmp(body, expectBody, strlen(expectBody)) == 0;
     }
+    if (r.ok) ReadServerClock(req.h, r);
     return r;
 }
 
-static bool PingAddr(IPAddr addr)
+// Does a request that bypasses the configured proxy get an answer?
+static bool DirectHttpWorks()
+{
+    ScopedWinHttp direct(WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!direct.h) return false;
+    WinHttpSetTimeouts(direct.h, 5000, 5000, 5000, 5000);
+    ScopedWinHttp con(WinHttpConnect(direct.h, L"www.msftconnecttest.com",
+                                     INTERNET_DEFAULT_HTTP_PORT, 0));
+    ScopedWinHttp req(con.h ? WinHttpOpenRequest(con.h, L"GET", L"/connecttest.txt",
+                                                 nullptr, WINHTTP_NO_REFERER,
+                                                 WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
+                            : nullptr);
+    return req.h &&
+           WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                              WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+           WinHttpReceiveResponse(req.h, nullptr);
+}
+
+static bool PingAddr(IPAddr addr, DWORD timeoutMs = 3000)
 {
     ScopedIcmp icmp(IcmpCreateFile());
     if (icmp.h == INVALID_HANDLE_VALUE) return false;
     char payload[32] = "NetVigil-probe";
     BYTE reply[sizeof(ICMP_ECHO_REPLY) + sizeof payload + 8] = {};
     DWORD n = IcmpSendEcho(icmp.h, addr, payload, sizeof payload,
-                           nullptr, reply, sizeof reply, 3000);
+                           nullptr, reply, sizeof reply, timeoutMs);
     if (n == 0) return false;
     return ((PICMP_ECHO_REPLY)reply)->Status == IP_SUCCESS;
 }
 
-static bool PingProbe(const char* ipStr)
+static uint32_t Ipv4(const char* s)
 {
     IN_ADDR addr{};
-    if (InetPtonA(AF_INET, ipStr, &addr) != 1) return false;
-    return PingAddr(addr.S_un.S_addr);
+    return InetPtonA(AF_INET, s, &addr) == 1 ? addr.S_un.S_addr : 0;
 }
 
-static Net CheckInternet()
+static bool PingProbe(const char* ipStr)
 {
+    uint32_t a = Ipv4(ipStr);
+    return a && PingAddr(a);
+}
+
+// A TCP handshake completed within the timeout?
+static bool TcpConnect(const sockaddr* to, int toLen, DWORD timeoutMs)
+{
+    if (!g_wsaOk) return false;
+    ScopedSocket s(socket(to->sa_family, SOCK_STREAM, IPPROTO_TCP));
+    if (!s.valid()) return false;
+    u_long nonBlocking = 1;
+    ioctlsocket(s.s, FIONBIO, &nonBlocking);
+    if (connect(s.s, to, toLen) == 0) return true;
+    if (WSAGetLastError() != WSAEWOULDBLOCK) return false;
+    fd_set wr, ex;
+    FD_ZERO(&wr);
+    FD_ZERO(&ex);
+    FD_SET(s.s, &wr);
+    FD_SET(s.s, &ex);
+    timeval tv{ (long)(timeoutMs / 1000), (long)((timeoutMs % 1000) * 1000) };
+    return select(0, nullptr, &wr, &ex, &tv) > 0 && FD_ISSET(s.s, &wr);
+}
+
+// Proves IP connectivity on networks that drop ICMP, without needing DNS.
+static bool TcpProbe(uint32_t addr, unsigned short port, DWORD timeoutMs)
+{
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port);
+    to.sin_addr.S_un.S_addr = addr;
+    return TcpConnect((const sockaddr*)&to, sizeof to, timeoutMs);
+}
+
+struct Connectivity {
+    Net  verdict = Net::Offline;
+    bool httpOk = false;       // expected content from an HTTP probe
+    bool httpAnswered = false; // an HTTP answer, but not the expected one
+    bool pingOk = false;
+    bool tcpOk = false;
+    bool clockKnown = false;
+    long long clockSkew = 0;
+};
+
+static Connectivity Probe()
+{
+    Connectivity c;
     ProbeResult a = HttpProbe(L"www.msftconnecttest.com", L"/connecttest.txt",
                               false, "Microsoft Connect Test");
-    if (a.ok) return Net::Online;
-    ProbeResult b = HttpProbe(L"www.gstatic.com", L"/generate_204", true, nullptr);
-    if (b.ok) return Net::Online;
-
-    bool ping = PingProbe("1.1.1.1") || PingProbe("8.8.8.8");
-    bool httpResponded = a.gotResponse || b.gotResponse;
-
-    if (ping)          return httpResponded ? Net::Portal : Net::Degraded;
-    if (httpResponded) return Net::Portal;
-    return Net::Offline;
+    ProbeResult b;
+    if (!a.ok) b = HttpProbe(L"www.gstatic.com", L"/generate_204", true, nullptr);
+    if (a.ok || b.ok) {
+        const ProbeResult& good = a.ok ? a : b;
+        c.verdict    = Net::Online;
+        c.httpOk     = true;
+        c.clockKnown = good.dateKnown;
+        c.clockSkew  = good.skewSec;
+        return c;
+    }
+    c.httpAnswered = a.gotResponse || b.gotResponse;
+    c.pingOk = PingProbe("1.1.1.1") || PingProbe("8.8.8.8");
+    if (!c.pingOk && !c.httpAnswered)   // ICMP may just be filtered
+        c.tcpOk = TcpProbe(Ipv4("1.1.1.1"), 443, 3000) || TcpProbe(Ipv4("8.8.8.8"), 443, 3000);
+    c.verdict = c.httpAnswered ? Net::Portal
+              : (c.pingOk || c.tcpOk) ? Net::Degraded
+                                       : Net::Offline;
+    return c;
 }
+
+static Net CheckInternet() { return Probe().verdict; }
 
 // ---------------------------------------------------------------- IP layer
 
 static DWORD RunProcess(const std::wstring& cmdLine, bool quiet); // fwd
 
-struct AdapterIpInfo {
-    std::wstring name;
-    DWORD  ifIndex   = 0;
-    bool   up        = false;
-    bool   wireless  = false;
-    bool   virt      = false;   // virtual/VPN/tunnel — never DHCP-repair these
-    bool   dhcp      = false;
-    bool   hasIpv4   = false;
-    bool   apipa     = false;   // 169.254.x.x — DHCP never answered
-    bool   hasGateway = false;
-    IN_ADDR gateway{};
-    std::wstring ipv4, gatewayStr, dns;
-};
-
-static std::wstring Ipv4ToStr(const IN_ADDR& a)
+static std::wstring Ipv4ToStr(uint32_t netOrder)
 {
+    IN_ADDR a{};
+    a.S_un.S_addr = netOrder;
     wchar_t buf[32] = {};
-    InetNtopW(AF_INET, (PVOID)&a, buf, 32);
+    InetNtopW(AF_INET, &a, buf, 32);
     return buf;
 }
 
@@ -769,15 +1050,26 @@ static bool LooksVirtualAdapter(const std::wstring& lowerText)
                                       L"loopback", L"vethernet", L"hyper-v",
                                       L"wsl", L"bluetooth", L"tunnel",
                                       L"tailscale", L"zerotier", L"wireguard",
-                                      L"wintun" };
+                                      L"wintun", L"miniport", L"kernel debug" };
     for (const wchar_t* k : kVirt)
         if (lowerText.find(k) != std::wstring::npos) return true;
     return false;
 }
 
-static std::vector<AdapterIpInfo> SnapshotAdapters()
+// DNS servers typed in by hand live in NameServer; DHCP-provided ones in
+// DhcpNameServer.
+static bool HasStaticDns(const std::wstring& guid)
 {
-    std::vector<AdapterIpInfo> out;
+    return !RegReadString(HKEY_LOCAL_MACHINE,
+                          L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\" +
+                              guid, L"NameServer").empty();
+}
+
+// Every IP-stack adapter, classified. Device state and device-only (e.g.
+// disabled) adapters are merged in later by MergeDevices.
+static std::vector<nv::AdapterObs> SnapshotAdapters()
+{
+    std::vector<nv::AdapterObs> out;
     ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST |
                   GAA_FLAG_SKIP_MULTICAST;
     ULONG sz = 16 * 1024;
@@ -794,64 +1086,81 @@ static std::vector<AdapterIpInfo> SnapshotAdapters()
     }
     for (auto* a = (IP_ADAPTER_ADDRESSES*)buf.data(); a; a = a->Next) {
         if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        AdapterIpInfo inf;
-        inf.name     = a->FriendlyName ? a->FriendlyName : L"";
-        inf.ifIndex  = a->IfIndex;
-        inf.up       = (a->OperStatus == IfOperStatusUp);
-        inf.wireless = (a->IfType == IF_TYPE_IEEE80211);
-        inf.dhcp     = (a->Dhcpv4Enabled != 0);
-        std::wstring desc = a->Description ? a->Description : L"";
-        inf.virt     = LooksVirtualAdapter(Lower(inf.name + L" " + desc));
+        nv::AdapterObs o;
+        o.name    = a->FriendlyName ? a->FriendlyName : L"";
+        o.id      = Utf8ToWide(a->AdapterName ? a->AdapterName : "");
+        o.ifIndex = a->IfIndex;
+        o.luid    = a->Luid.Value;
+        o.up      = (a->OperStatus == IfOperStatusUp);
+        o.dhcp    = (a->Dhcpv4Enabled != 0);
+        o.kind    = a->IfType == IF_TYPE_IEEE80211 ? nv::Kind::Wifi
+                  : a->IfType == IF_TYPE_ETHERNET_CSMACD ? nv::Kind::Ethernet
+                  : a->IfType == IF_TYPE_WWANPP || a->IfType == IF_TYPE_WWANPP2
+                        ? nv::Kind::Cellular
+                        : nv::Kind::Other;
+
         for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
-            if (ua->Address.lpSockaddr && ua->Address.lpSockaddr->sa_family == AF_INET) {
-                IN_ADDR ip = ((sockaddr_in*)ua->Address.lpSockaddr)->sin_addr;
-                inf.hasIpv4 = true;
-                inf.apipa = (ip.S_un.S_un_b.s_b1 == 169 && ip.S_un.S_un_b.s_b2 == 254);
-                inf.ipv4 = Ipv4ToStr(ip);
-                break;
+            if (!ua->Address.lpSockaddr || ua->Address.lpSockaddr->sa_family != AF_INET)
+                continue;
+            if (ua->DadState == IpDadStateDuplicate) { // Windows saw an address conflict
+                o.duplicate = true;
+                continue;
             }
+            IN_ADDR ip = ((sockaddr_in*)ua->Address.lpSockaddr)->sin_addr;
+            if (o.hasIpv4 && ua->DadState != IpDadStatePreferred) continue;
+            o.hasIpv4 = true;
+            o.apipa = (ip.S_un.S_un_b.s_b1 == 169 && ip.S_un.S_un_b.s_b2 == 254);
+            o.ip = Ipv4ToStr(ip.S_un.S_addr);
+            if (ua->DadState == IpDadStatePreferred) break;
         }
         for (auto* ga = a->FirstGatewayAddress; ga; ga = ga->Next) {
             if (ga->Address.lpSockaddr && ga->Address.lpSockaddr->sa_family == AF_INET) {
-                inf.gateway = ((sockaddr_in*)ga->Address.lpSockaddr)->sin_addr;
-                inf.hasGateway = true;
-                inf.gatewayStr = Ipv4ToStr(inf.gateway);
+                o.gatewayIp = ((sockaddr_in*)ga->Address.lpSockaddr)->sin_addr.S_un.S_addr;
+                o.hasGateway = true;
+                o.gw = Ipv4ToStr(o.gatewayIp);
                 break;
             }
         }
-        int dnsCount = 0;
-        for (auto* da = a->FirstDnsServerAddress; da && dnsCount < 2; da = da->Next) {
-            if (da->Address.lpSockaddr && da->Address.lpSockaddr->sa_family == AF_INET) {
-                if (dnsCount) inf.dns += L", ";
-                inf.dns += Ipv4ToStr(((sockaddr_in*)da->Address.lpSockaddr)->sin_addr);
-                ++dnsCount;
-            }
+        for (auto* da = a->FirstDnsServerAddress; da && o.dnsIps.size() < 3; da = da->Next)
+            if (da->Address.lpSockaddr && da->Address.lpSockaddr->sa_family == AF_INET)
+                o.dnsIps.push_back(((sockaddr_in*)da->Address.lpSockaddr)->sin_addr.S_un.S_addr);
+        o.dnsServers = (int)o.dnsIps.size();
+        o.staticDns  = o.dnsServers > 0 && (!o.dhcp || HasStaticDns(o.id));
+
+        // Physical or not: NDIS knows (the same flag Get-NetAdapter -Physical
+        // uses); descriptions are only the fallback.
+        std::wstring text = Lower(o.name + L" " + (a->Description ? a->Description : L""));
+        MIB_IF_ROW2 row{};
+        row.InterfaceLuid = a->Luid;
+        bool haveRow = GetIfEntry2(&row) == NO_ERROR;
+        bool hardware = haveRow ? row.InterfaceAndOperStatusFlags.HardwareInterface != FALSE
+                                : !LooksVirtualAdapter(text);
+        o.media = haveRow ? row.MediaConnectState == MediaConnectStateConnected : o.up;
+        if (text.find(L"hyper-v virtual ethernet") != std::wstring::npos && o.hasGateway) {
+            // Host side of an external virtual switch: this IS the uplink
+            // (the physical NIC under it has no IP). Never reset it, though.
+            o.virt = false;
+            o.kind = nv::Kind::Other;
+        } else {
+            o.virt = !hardware || text.find(L"bluetooth") != std::wstring::npos;
         }
-        out.push_back(std::move(inf));
+        out.push_back(std::move(o));
     }
     return out;
 }
 
-static void LogNetSnapshot()
+static std::wstring DnsListStr(const std::vector<uint32_t>& ips)
 {
-    std::vector<AdapterIpInfo> ads = SnapshotAdapters();
-    if (ads.empty()) {
-        Logf(L"  [ip] no adapters visible to the IP stack");
-        return;
+    std::wstring s;
+    for (uint32_t ip : ips) {
+        if (!s.empty()) s += L", ";
+        s += Ipv4ToStr(ip);
     }
-    for (const auto& a : ads) {
-        if (!a.up && !a.wireless) continue; // down virtual clutter
-        Logf(L"  [ip] %ls: %ls, ip %ls%ls, gw %ls, dns %ls",
-             a.name.c_str(), a.up ? L"up" : L"down",
-             a.hasIpv4 ? a.ipv4.c_str() : L"none",
-             a.apipa ? L" (APIPA — DHCP failed)" : L"",
-             a.hasGateway ? a.gatewayStr.c_str() : L"none",
-             a.dns.empty() ? L"none" : a.dns.c_str());
-    }
+    return s.empty() ? L"none" : s;
 }
 
 // Release + renew the DHCP lease on one adapter — the fix for an APIPA
-// address or a lost gateway after the AP/router restarted.
+// address, an address conflict, or a lost gateway after the router restarted.
 static bool RenewDhcp(DWORD ifIndex, const std::wstring& name)
 {
     ULONG sz = 0;
@@ -891,72 +1200,193 @@ static void FlushDnsCache()
     if (!tried) {
         tried = true;
         if (HMODULE m = LoadLibraryW(Sys32(L"dnsapi.dll").c_str()))
-            flush = (PfnFlush)GetProcAddress(m, "DnsFlushResolverCache");
+            flush = (PfnFlush)(void*)GetProcAddress(m, "DnsFlushResolverCache");
     }
     if (flush && flush()) {
-        Logf(L"DNS resolver cache flushed");
+        Logf(L"  DNS resolver cache flushed");
         return;
     }
     DWORD rc = RunProcess(L"\"" + Sys32(L"ipconfig.exe") + L"\" /flushdns", true);
-    Logf(rc == 0 ? L"DNS resolver cache flushed (ipconfig)"
-                 : L"DNS cache flush failed (rc=%u)", rc);
+    Logf(rc == 0 ? L"  DNS resolver cache flushed (ipconfig)"
+                 : L"  DNS cache flush failed (rc=%u)", rc);
 }
 
-// Degraded = ICMP works but HTTP/DNS fails. Try cheap repairs without
-// touching Wi-Fi: proxy diagnosis, DNS cache flush. Rate-limited so a real
-// upstream DNS outage doesn't get flushed every cycle.
-static Net DiagnoseDegraded()
+// Stale neighbour entries (a router swapped for one with the same address,
+// a MAC that moved) blackhole traffic until they age out.
+static bool FlushArpCache(DWORD ifIndex, const std::wstring& name)
 {
-    static ULONGLONG lastFix = 0;
-    ULONGLONG now = GetTickCount64();
-    if (lastFix != 0 && now - lastFix < 30ull * 60 * 1000) return Net::Degraded;
-    lastFix = now;
-
-    // If a proxy-bypassing request works, the system proxy is the problem —
-    // not something a watchdog should rewrite, but worth naming precisely.
-    ScopedWinHttp direct(WinHttpOpen(L"NetVigil/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    if (direct.h) {
-        WinHttpSetTimeouts(direct.h, 5000, 5000, 5000, 5000);
-        ScopedWinHttp con(WinHttpConnect(direct.h, L"www.msftconnecttest.com",
-                                         INTERNET_DEFAULT_HTTP_PORT, 0));
-        ScopedWinHttp req(con.h ? WinHttpOpenRequest(con.h, L"GET", L"/connecttest.txt",
-                                                     nullptr, WINHTTP_NO_REFERER,
-                                                     WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
-                                : nullptr);
-        if (req.h &&
-            WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-            WinHttpReceiveResponse(req.h, nullptr)) {
-            Logf(L"proxy failure suspected: direct HTTP works but the configured "
-                 L"proxy path fails — check the system proxy settings");
-            return Net::Degraded;
-        }
-    }
-
-    FlushDnsCache();
-    Sleep(2000);
-    Net n = CheckInternet();
-    Logf(n == Net::Online ? L"DNS cache flush restored HTTP connectivity"
-                          : L"still degraded after DNS flush (upstream DNS problem?)");
-    return n;
+    DWORD rc = FlushIpNetTable2(AF_INET, ifIndex);
+    Logf(rc == NO_ERROR ? L"  [%ls] ARP cache flushed" : L"  [%ls] ARP flush failed (%u)",
+         name.c_str(), rc);
+    return rc == NO_ERROR;
 }
 
-// Does any Wi-Fi adapter's own gateway answer? That specific combination —
-// wireless link up, its router reachable, internet dead — proves the Wi-Fi
-// path is healthy and the outage is upstream. A live gateway on some OTHER
-// NIC (ethernet to a NAS subnet, a phone tether) proves nothing about Wi-Fi.
-static bool WifiGatewayAlive()
+// Does the adapter's router answer? Ping first; many routers also answer a
+// fresh ARP request when they ignore ping, which still proves the link.
+static int ProbeGateway(const nv::AdapterObs& a)
 {
-    for (const auto& a : SnapshotAdapters()) {
-        if (!a.up || a.virt || !a.wireless || !a.hasGateway) continue;
-        if (PingAddr(a.gateway.S_un.S_addr)) {
-            Logf(L"[%ls] gateway %ls answers ping", a.name.c_str(),
-                 a.gatewayStr.c_str());
-            return true;
+    if (!a.gatewayIp) return -1;
+    if (PingAddr(a.gatewayIp, 1500)) return 1;
+    MIB_IPNET_ROW2 row{};
+    row.Address.si_family = AF_INET;
+    row.Address.Ipv4.sin_family = AF_INET;
+    row.Address.Ipv4.sin_addr.S_un.S_addr = a.gatewayIp;
+    row.InterfaceIndex = a.ifIndex;
+    row.InterfaceLuid.Value = a.luid;
+    DWORD rc = ResolveIpNetEntry2(&row, nullptr);   // flushes the entry, re-ARPs
+    if (rc == NO_ERROR) return row.PhysicalAddressLength > 0 ? 1 : 0;
+    if (rc == ERROR_ACCESS_DENIED) {
+        // Not elevated, so no fresh ARP: a cached entry may be stale, and
+        // only one Windows confirmed recently proves the router is there.
+        MIB_IPNET_ROW2 cur{};
+        cur.Address = row.Address;
+        cur.InterfaceIndex = a.ifIndex;
+        cur.InterfaceLuid.Value = a.luid;
+        return GetIpNetEntry2(&cur) == NO_ERROR && cur.State == NlnsReachable ? 1 : -1;
+    }
+    return 0;
+}
+
+// One A query to each server at once; alive[i] = server i answered at all
+// (any RCODE: a dead server is silent, a picky one still answers).
+static std::vector<bool> DnsServersAnswer(const std::vector<uint32_t>& servers, DWORD timeoutMs)
+{
+    std::vector<bool> alive(servers.size(), false);
+    if (!g_wsaOk || servers.empty()) return alive;
+    ScopedSocket s(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    if (!s.valid()) return alive;
+    uint16_t base = (uint16_t)(GetTickCount64() ^ ((ULONGLONG)GetCurrentProcessId() << 5));
+    for (size_t i = 0; i < servers.size(); ++i) {
+        std::vector<uint8_t> q = nv::BuildDnsQuery((uint16_t)(base + i), kDnsProbeHost);
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(53);
+        to.sin_addr.S_un.S_addr = servers[i];
+        sendto(s.s, (const char*)q.data(), (int)q.size(), 0, (const sockaddr*)&to, sizeof to);
+    }
+    size_t pending = servers.size();
+    ULONGLONG end = GetTickCount64() + timeoutMs;
+    while (pending) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= end) break;
+        ULONGLONG left = end - now;
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(s.s, &rd);
+        timeval tv{ (long)(left / 1000), (long)((left % 1000) * 1000) };
+        if (select(0, &rd, nullptr, nullptr, &tv) <= 0) break;
+        uint8_t reply[512];
+        sockaddr_in from{};
+        int fromLen = sizeof from;
+        int n = recvfrom(s.s, (char*)reply, sizeof reply, 0, (sockaddr*)&from, &fromLen);
+        if (n <= 0) continue; // e.g. WSAECONNRESET from an ICMP port-unreachable
+        for (size_t i = 0; i < servers.size(); ++i) {
+            if (!alive[i] && from.sin_addr.S_un.S_addr == servers[i] &&
+                nv::ParseDnsReply(reply, (size_t)n, (uint16_t)(base + i), nullptr) >= 0) {
+                alive[i] = true;
+                --pending;
+            }
         }
     }
-    return false;
+    return alive;
+}
+
+// The system resolver, bypassing its cache — what every application uses.
+// Bounded: with dead servers the resolver retries for ~10 s.
+static bool SystemDnsWorks(DWORD timeoutMs)
+{
+    auto result = std::make_shared<std::atomic<int>>(0);
+    bool finished = RunBounded(timeoutMs, [result] {
+        PDNS_RECORD rec = nullptr;
+        DNS_STATUS st = DnsQuery_W(L"www.msftconnecttest.com", DNS_TYPE_A,
+                                   DNS_QUERY_BYPASS_CACHE, nullptr, &rec, nullptr);
+        if (rec) DnsRecordListFree(rec, DnsFreeRecordList);
+        *result = st == 0 ? 1 : -1;
+    });
+    return finished && *result == 1;
+}
+
+static bool TcpLoopbackAlive(const std::wstring& host, unsigned port)
+{
+    std::wstring h = Lower(host);
+    if (h.size() > 2 && h.front() == L'[' && h.back() == L']') h = h.substr(1, h.size() - 2);
+    sockaddr_in6 v6{};
+    v6.sin6_family = AF_INET6;
+    v6.sin6_port = htons((unsigned short)port);
+    v6.sin6_addr.s6_addr[15] = 1;                    // ::1
+    if (h.find(L':') != std::wstring::npos)
+        return TcpConnect((const sockaddr*)&v6, sizeof v6, 1500);
+    if (h == L"localhost" || h == L"localhost.")
+        return TcpProbe(htonl(INADDR_LOOPBACK), (unsigned short)port, 1500) ||
+               TcpConnect((const sockaddr*)&v6, sizeof v6, 1500);
+    IN_ADDR a{};
+    if (InetPtonW(AF_INET, h.c_str(), &a) != 1) return true; // can't tell: assume alive
+    return TcpProbe(a.S_un.S_addr, (unsigned short)port, 1500);
+}
+
+static void ObserveProxy(nv::ProbeObs& p)
+{
+    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG cfg{};
+    if (!WinHttpGetIEProxyConfigForCurrentUser(&cfg)) return;
+    std::wstring spec = cfg.lpszProxy ? cfg.lpszProxy : L"";
+    if (cfg.lpszProxy) GlobalFree(cfg.lpszProxy);
+    if (cfg.lpszProxyBypass) GlobalFree(cfg.lpszProxyBypass);
+    if (cfg.lpszAutoConfigUrl) GlobalFree(cfg.lpszAutoConfigUrl);
+    nv::ProxyEndpoint ep;
+    if (spec.empty() || !nv::PickHttpProxy(spec, ep)) return;
+    p.proxyOn = true;
+    p.proxy = (ep.host.find(L':') != std::wstring::npos ? L"[" + ep.host + L"]" : ep.host) +
+              L":" + std::to_wstring(ep.port);
+    if (nv::IsLoopbackHost(ep.host))
+        p.proxyDead = !TcpLoopbackAlive(ep.host, ep.port);
+    if (!p.proxyDead) p.directOk = DirectHttpWorks();
+}
+
+// Hand-set proxy nothing listens on: switch it off, and say what it was.
+static bool DisableDeadProxy(const nv::ProbeObs& p)
+{
+    // A proxy tool restarting (they often do on a network change) is not a
+    // dead one: it must still be silent half a minute later.
+    nv::ProxyEndpoint ep;
+    if (!nv::PickHttpProxy(p.proxy, ep)) return false;
+    Logf(L"  making sure nothing is listening on %ls (30 s)", p.proxy.c_str());
+    if (WaitStop(30000)) return false;
+    if (TcpLoopbackAlive(ep.host, ep.port)) {
+        Logf(L"  the proxy at %ls answers again — leaving it on", p.proxy.c_str());
+        return false;
+    }
+    std::wstring was;
+    if (!DisableManualProxy(&was)) return false;
+    Logf(L"  manual proxy '%ls' switched off — turn it back on under Settings > Network > "
+         L"Proxy if the tool that used it returns", was.c_str());
+    SaveSetting(L"disabledProxy", was);
+    ResetHttpSession(); // drop the probe session's cached proxy configuration
+    return true;
+}
+
+// Mark the adapter holding the best route to the internet.
+static void MarkRouteAdapter(std::vector<nv::AdapterObs>& ads)
+{
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.S_un.S_addr = Ipv4("1.1.1.1");
+    DWORD idx = 0;
+    if (GetBestInterfaceEx((sockaddr*)&dst, &idx) != NO_ERROR) return;
+    for (auto& a : ads) {
+        if (a.hasIf && a.ifIndex == idx) {
+            a.routesInternet = true;
+            break;
+        }
+    }
+}
+
+// Windows airplane mode (the radio-management system state).
+static bool AirplaneModeOn()
+{
+    DWORD v = 0;
+    return RegReadDword(HKEY_LOCAL_MACHINE,
+                        L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement\\SystemRadioState",
+                        nullptr, v) && v == 1;
 }
 
 // ---------------------------------------------------------------- WLAN
@@ -981,13 +1411,13 @@ static const wchar_t* IfStateStr(WLAN_INTERFACE_STATE s)
     }
 }
 
-static HANDLE OpenWlan()
+static HANDLE OpenWlan(bool quiet = false)
 {
     DWORD ver = 0;
     HANDLE h = nullptr;
     DWORD rc = WlanOpenHandle(2, nullptr, &ver, &h);
     if (rc != ERROR_SUCCESS) {
-        Logf(L"WlanOpenHandle failed (%u)", rc);
+        if (!quiet) Logf(L"WlanOpenHandle failed (%u)", rc);
         return nullptr;
     }
     return h;
@@ -1060,7 +1490,7 @@ static std::wstring GetConnectedSsid(HANDLE h, const GUID& g)
 // First connected WLAN interface: what the machine is on right now.
 static bool CurrentConnection(std::wstring& ssid, std::wstring& iface, std::wstring& profile)
 {
-    ScopedWlan wl(OpenWlan());
+    ScopedWlan wl(OpenWlan(true));
     if (!wl.h) return false;
     for (const auto& i : EnumWlanIfaces(wl.h)) {
         if (GetConnection(wl.h, i.guid, ssid, profile)) {
@@ -1069,6 +1499,23 @@ static bool CurrentConnection(std::wstring& ssid, std::wstring& iface, std::wstr
         }
     }
     return false;
+}
+
+// Radio switches of one interface: any PHY off in software / in hardware.
+static void RadioState(HANDLE h, const GUID& g, bool& softOff, bool& hardOff)
+{
+    ScopedWlanMem mem;
+    DWORD sz = 0;
+    WLAN_OPCODE_VALUE_TYPE t;
+    if (WlanQueryInterface(h, &g, wlan_intf_opcode_radio_state, nullptr,
+                           &sz, &mem.p, &t) != ERROR_SUCCESS ||
+        !mem.p || sz < sizeof(WLAN_RADIO_STATE))
+        return;
+    const WLAN_RADIO_STATE* rs = mem.as<WLAN_RADIO_STATE>();
+    for (DWORD i = 0; i < rs->dwNumberOfPhys && i < WLAN_MAX_PHY_INDEX; ++i) {
+        if (rs->PhyRadioState[i].dot11SoftwareRadioState == dot11_radio_state_off) softOff = true;
+        if (rs->PhyRadioState[i].dot11HardwareRadioState == dot11_radio_state_off) hardOff = true;
+    }
 }
 
 // Turn on any software-disabled radio; returns true if something was flipped.
@@ -1120,6 +1567,89 @@ static void EnsureAutoConfig(HANDLE h, const GUID& g, const std::wstring& desc)
          desc.c_str(), rc);
 }
 
+// Connection failures reported by WlanSvc, per profile. A profile whose
+// security negotiation keeps failing has a stale saved password: retrying it
+// (or resetting hardware over it) cannot help — the user must re-enter it.
+struct WlanFailure {
+    int securityFails = 0;       // consecutive credential/handshake failures
+    DWORD reason = 0;            // last reason code
+    ULONGLONG tick = 0;          // when it was recorded
+};
+static std::map<std::wstring, WlanFailure> g_wlanFails;   // guarded by g_wlanCs
+
+static VOID WINAPI OnWlanNotify(PWLAN_NOTIFICATION_DATA data, PVOID)
+{
+    if (!data || data->NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM) return;
+    if (data->NotificationCode != (DWORD)wlan_notification_acm_connection_complete &&
+        data->NotificationCode != (DWORD)wlan_notification_acm_connection_attempt_fail)
+        return;
+    if (!data->pData ||
+        data->dwDataSize < offsetof(WLAN_CONNECTION_NOTIFICATION_DATA, strProfileXml))
+        return;
+    const auto* c = (const WLAN_CONNECTION_NOTIFICATION_DATA*)data->pData;
+    std::wstring profile(c->strProfileName, wcsnlen(c->strProfileName, WLAN_MAX_NAME_LENGTH));
+    if (profile.empty()) return;
+    EnterCriticalSection(&g_wlanCs);
+    if (c->wlanReasonCode == 0) {
+        g_wlanFails.erase(profile);
+    } else {
+        WlanFailure& f = g_wlanFails[profile];
+        if (nv::ClassifyWlanReason(c->wlanReasonCode) == nv::WlanFail::Security)
+            ++f.securityFails;
+        f.reason = c->wlanReasonCode;
+        f.tick = GetTickCount64();
+    }
+    LeaveCriticalSection(&g_wlanCs);
+}
+
+// Registers for WlanSvc connection notifications on a handle while in scope.
+struct WlanFailureWatch {
+    HANDLE h = nullptr;
+    explicit WlanFailureWatch(HANDLE wl)
+    {
+        if (WlanRegisterNotification(wl, WLAN_NOTIFICATION_SOURCE_ACM, TRUE, OnWlanNotify,
+                                     nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+            h = wl;
+    }
+    ~WlanFailureWatch()
+    {
+        if (h) WlanRegisterNotification(h, WLAN_NOTIFICATION_SOURCE_NONE, TRUE, nullptr,
+                                        nullptr, nullptr, nullptr);
+    }
+    WlanFailureWatch(const WlanFailureWatch&) = delete;
+    WlanFailureWatch& operator=(const WlanFailureWatch&) = delete;
+};
+
+static bool AuthFailedRecently(const std::wstring& profile)
+{
+    EnterCriticalSection(&g_wlanCs);
+    auto it = g_wlanFails.find(profile);
+    bool failed = it != g_wlanFails.end() && it->second.securityFails >= 2 &&
+                  GetTickCount64() - it->second.tick < kAuthFailWindowMs;
+    LeaveCriticalSection(&g_wlanCs);
+    return failed;
+}
+
+// Reason code of the latest failure for a profile at or after `since`.
+static DWORD WlanFailureSince(const std::wstring& profile, ULONGLONG since)
+{
+    EnterCriticalSection(&g_wlanCs);
+    auto it = g_wlanFails.find(profile);
+    DWORD r = it != g_wlanFails.end() && it->second.tick >= since ? it->second.reason : 0;
+    LeaveCriticalSection(&g_wlanCs);
+    return r;
+}
+
+static std::wstring WlanReasonText(DWORD reason)
+{
+    wchar_t buf[256] = {};
+    if (WlanReasonCodeToString(reason, 256, buf, nullptr) != ERROR_SUCCESS || !buf[0])
+        return L"reason unknown";
+    std::wstring s = buf;
+    while (!s.empty() && (s.back() == L'.' || iswspace(s.back()))) s.pop_back();
+    return s;
+}
+
 struct Candidate {
     std::wstring profile;
     DOT11_BSS_TYPE bss = dot11_BSS_type_infrastructure;
@@ -1166,23 +1696,34 @@ static std::vector<Candidate> GetCandidates(HANDLE h, const GUID& g)
     return v;
 }
 
-// Apply the user's per-network policy: drop "never" networks, put the
-// preferred one first (it still has to be in the list, i.e. in range).
+// Apply the user's per-network policy: drop "never" networks and profiles
+// whose saved password keeps being rejected, put the preferred one first (it
+// still has to be in the list, i.e. in range).
 static void ApplyNetworkPreferences(std::vector<Candidate>& cands, const std::wstring& desc)
 {
-    std::vector<Candidate> kept;
-    std::vector<std::wstring> skipped;
+    std::vector<Candidate> kept, failing;
     for (auto& c : cands) {
-        NetMode m = ModeOf(c.profile);
-        if (m == NetMode::Never) skipped.push_back(c.profile);
-        else kept.push_back(std::move(c));
+        if (ModeOf(c.profile) == NetMode::Never)
+            Logf(L"  [%ls] skipping '%ls' (marked never connect)", desc.c_str(), c.profile.c_str());
+        else if (AuthFailedRecently(c.profile))
+            failing.push_back(std::move(c));
+        else
+            kept.push_back(std::move(c));
     }
+    // A network whose security handshake keeps failing is skipped while
+    // anything else is in range — and still tried when nothing is (the
+    // failure may be a wedged driver's, not a changed password).
+    for (auto& c : failing) {
+        Logf(kept.empty() ? L"  [%ls] '%ls' keeps failing its security handshake — trying it "
+                            L"anyway (nothing else in range)"
+                          : L"  [%ls] skipping '%ls' for now (its security handshake keeps failing)",
+             desc.c_str(), c.profile.c_str());
+    }
+    if (kept.empty()) kept.swap(failing);
     std::stable_partition(kept.begin(), kept.end(), [](const Candidate& c) {
         return ModeOf(c.profile) == NetMode::Preferred;
     });
     cands.swap(kept);
-    for (const auto& s : skipped)
-        Logf(L"  [%ls] skipping '%ls' (marked never connect)", desc.c_str(), s.c_str());
     if (!cands.empty() && ModeOf(cands[0].profile) == NetMode::Preferred)
         Logf(L"  [%ls] preferred network '%ls' goes first", desc.c_str(),
              cands[0].profile.c_str());
@@ -1198,11 +1739,44 @@ static bool WaitConnected(HANDLE h, const GUID& g, DWORD ms)
     return GetIfaceState(h, g) == wlan_interface_state_connected;
 }
 
+// Associate one interface to one profile; on failure log WlanSvc's reason
+// and whether the saved password is the likely culprit.
+static bool ConnectProfile(HANDLE h, const WlanIfaceInfo& inf, const Candidate& c)
+{
+    WLAN_CONNECTION_PARAMETERS p{};
+    p.wlanConnectionMode = wlan_connection_mode_profile;
+    p.strProfile   = c.profile.c_str();
+    p.dot11BssType = c.bss;
+    ULONGLONG started = GetTickCount64();
+    DWORD rc = WlanConnect(h, &inf.guid, &p, nullptr);
+    if (rc == ERROR_SUCCESS && WaitConnected(h, inf.guid, 20000)) return true;
+    DWORD reason = WlanFailureSince(c.profile, started);
+    if (reason)
+        Logf(L"  [%ls] connect to '%ls' failed: %ls (0x%X)", inf.desc.c_str(),
+             c.profile.c_str(), WlanReasonText(reason).c_str(), reason);
+    else
+        Logf(L"  [%ls] connect to '%ls' failed (rc=%u)", inf.desc.c_str(), c.profile.c_str(), rc);
+    if (AuthFailedRecently(c.profile))
+        Logf(L"  [%ls] '%ls' keeps failing its security handshake (changed password?) — other "
+             L"networks go first for %llu min", inf.desc.c_str(), c.profile.c_str(),
+             kAuthFailWindowMs / 60000ull);
+    return false;
+}
+
 // Try to get one interface associated to a remembered network.
 static bool ReconnectIface(HANDLE h, const WlanIfaceInfo& inf, bool bounceIfConnected)
 {
     EnsureAutoConfig(h, inf.guid, inf.desc);
-    if (EnsureRadioOn(h, inf.guid)) Sleep(3000);
+    if (AirplaneModeOn()) {
+        bool soft = false, hard = false;
+        RadioState(h, inf.guid, soft, hard);
+        if (soft) {
+            Logf(L"  [%ls] airplane mode is on — not overriding it", inf.desc.c_str());
+            return false;
+        }
+    } else if (EnsureRadioOn(h, inf.guid)) {
+        Sleep(3000);
+    }
 
     WLAN_INTERFACE_STATE st = GetIfaceState(h, inf.guid);
     if (st == wlan_interface_state_connected) {
@@ -1241,8 +1815,7 @@ static bool ReconnectIface(HANDLE h, const WlanIfaceInfo& inf, bool bounceIfConn
     }
     ApplyNetworkPreferences(cands, inf.desc);
     if (cands.empty()) {
-        Logf(L"  [%ls] no in-range remembered networks and no saved profiles",
-             inf.desc.c_str());
+        Logf(L"  [%ls] no usable remembered network in range", inf.desc.c_str());
         return false;
     }
 
@@ -1255,16 +1828,7 @@ static bool ReconnectIface(HANDLE h, const WlanIfaceInfo& inf, bool bounceIfConn
         const Candidate& c = cands[i];
         Logf(L"  [%ls] connecting to '%ls' (signal %u%%)",
              inf.desc.c_str(), c.profile.c_str(), c.quality);
-        WLAN_CONNECTION_PARAMETERS p{};
-        p.wlanConnectionMode = wlan_connection_mode_profile;
-        p.strProfile   = c.profile.c_str();
-        p.dot11BssType = c.bss;
-        DWORD rc = WlanConnect(h, &inf.guid, &p, nullptr);
-        if (rc != ERROR_SUCCESS || !WaitConnected(h, inf.guid, 20000)) {
-            Logf(L"  [%ls] connect to '%ls' failed (rc=%u)",
-                 inf.desc.c_str(), c.profile.c_str(), rc);
-            continue;
-        }
+        if (!ConnectProfile(h, inf, c)) continue;
         Logf(L"  [%ls] associated to '%ls' — verifying internet",
              inf.desc.c_str(), c.profile.c_str());
         if (WaitStop(3000)) return true; // let DHCP/DNS settle
@@ -1309,6 +1873,7 @@ static bool WifiReconnectAll(bool bounceIfConnected)
         Logf(L"cannot talk to WLAN service (WlanOpenHandle failed)");
         return false;
     }
+    WlanFailureWatch watch(wl.h);
     std::vector<WlanIfaceInfo> ifs = EnumWlanIfaces(wl.h);
     if (ifs.empty())
         Logf(L"no WLAN interfaces present (adapter unplugged, disabled, or driver wedged)");
@@ -1318,19 +1883,112 @@ static bool WifiReconnectAll(bool bounceIfConnected)
     return any;
 }
 
-// NetCfgInstanceId strings ("{...}") of current WLAN interfaces, physical
-// ones preferred (skip Wi-Fi Direct style virtual interfaces).
-static std::vector<std::wstring> CurrentWlanAdapterIds()
+static bool RadioOnAll()
 {
-    std::vector<std::wstring> ids;
-    ScopedWlan wl(OpenWlan());
-    if (!wl.h) return ids;
-    for (const auto& i : EnumWlanIfaces(wl.h)) {
-        if (Lower(i.desc).find(L"virtual") != std::wstring::npos) continue;
-        wchar_t g[64] = {};
-        if (StringFromGUID2(i.guid, g, 64) > 0) ids.push_back(g);
+    if (AirplaneModeOn()) {
+        Logf(L"  airplane mode is on — leaving the radio alone");
+        return false;
     }
-    return ids;
+    ScopedWlan wl(OpenWlan());
+    if (!wl.h) return false;
+    bool any = false;
+    for (const auto& i : EnumWlanIfaces(wl.h))
+        any = EnsureRadioOn(wl.h, i.guid) || any;
+    return any;
+}
+
+// ISP outage on the current Wi-Fi network: try other in-range saved networks
+// (policy order), keep the first that really has internet, otherwise go back
+// to the original one.
+static bool SwitchWifiNetwork()
+{
+    ScopedWlan wl(OpenWlan());
+    if (!wl.h) return false;
+    WlanFailureWatch watch(wl.h);
+    for (const auto& inf : EnumWlanIfaces(wl.h)) {
+        std::wstring ssid, current;
+        if (!GetConnection(wl.h, inf.guid, ssid, current)) continue;
+        std::vector<Candidate> cands = GetCandidates(wl.h, inf.guid);
+        ApplyNetworkPreferences(cands, inf.desc);
+        cands.erase(std::remove_if(cands.begin(), cands.end(),
+                                   [&](const Candidate& c) { return c.profile == current; }),
+                    cands.end());
+        if (cands.empty()) {
+            Logf(L"  [%ls] no other saved network in range", inf.desc.c_str());
+            continue;
+        }
+        size_t tries = cands.size() < 2 ? cands.size() : 2;
+        for (size_t i = 0; i < tries; ++i) {
+            if (StopRequested()) return false;
+            Logf(L"  [%ls] '%ls' has no internet upstream — trying '%ls' (signal %u%%)",
+                 inf.desc.c_str(), current.c_str(), cands[i].profile.c_str(), cands[i].quality);
+            if (!ConnectProfile(wl.h, inf, cands[i])) continue;
+            if (WaitStop(3000)) return false;
+            Net n = CheckInternet();
+            if (n == Net::Online || n == Net::Degraded) {
+                Logf(L"  [%ls] switched to '%ls' — it has working internet",
+                     inf.desc.c_str(), cands[i].profile.c_str());
+                return true;
+            }
+            Logf(L"  [%ls] '%ls' has no working internet either", inf.desc.c_str(),
+                 cands[i].profile.c_str());
+        }
+        Logf(L"  [%ls] no alternative worked — returning to '%ls'", inf.desc.c_str(),
+             current.c_str());
+        Candidate back;
+        back.profile = current;
+        ConnectProfile(wl.h, inf, back);
+    }
+    return false;
+}
+
+// What the diagnosis needs to know about Wi-Fi. Scans first when nothing is
+// associated, so "no networks visible" is fresh, not a stale cache.
+static void ObserveWlan(nv::WifiObs& w, std::vector<std::wstring>& guids, bool scanIfIdle)
+{
+    ScopedWlan wl(OpenWlan(true));
+    if (!wl.h) return;
+    std::vector<WlanIfaceInfo> ifs = EnumWlanIfaces(wl.h);
+    w.interfaces = (int)ifs.size();
+    for (const auto& i : ifs) {
+        wchar_t g[64] = {};
+        if (StringFromGUID2(i.guid, g, 64) > 0) guids.push_back(g);
+        if (GetIfaceState(wl.h, i.guid) == wlan_interface_state_connected) w.associated = true;
+        RadioState(wl.h, i.guid, w.radioSoftOff, w.radioHardOff);
+    }
+    if (ifs.empty()) return;
+    if (!w.associated && scanIfIdle && !w.radioSoftOff && !w.radioHardOff) {
+        for (const auto& i : ifs) WlanScan(wl.h, &i.guid, nullptr, nullptr, nullptr);
+        WaitStop(4000);
+    }
+    std::set<std::string> ssids;
+    std::set<std::wstring> known;
+    for (const auto& i : ifs) {
+        PWLAN_AVAILABLE_NETWORK_LIST list = nullptr;
+        if (WlanGetAvailableNetworkList(wl.h, &i.guid,
+                WLAN_AVAILABLE_NETWORK_INCLUDE_ALL_MANUAL_HIDDEN_PROFILES,
+                nullptr, &list) != ERROR_SUCCESS || !list)
+            continue;
+        ScopedWlanMem mem;
+        mem.p = list;
+        for (DWORD n = 0; n < list->dwNumberOfItems; ++n) {
+            const WLAN_AVAILABLE_NETWORK& a = list->Network[n];
+            ssids.insert(std::string((const char*)a.dot11Ssid.ucSSID,
+                                     a.dot11Ssid.uSSIDLength <= DOT11_SSID_MAX_LENGTH
+                                         ? a.dot11Ssid.uSSIDLength : 0));
+            if (!(a.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) || !a.strProfileName[0] ||
+                !a.bNetworkConnectable)
+                continue;
+            std::wstring profile = a.strProfileName;
+            if (AuthFailedRecently(profile)) {
+                if (w.authFailed.empty()) w.authFailed = profile;
+            } else if (ModeOf(profile) != NetMode::Never) {
+                known.insert(profile);
+            }
+        }
+    }
+    w.visible = (int)ssids.size();
+    w.knownInRange = (int)known.size();
 }
 
 // Everything the GUI lists: saved profiles + remembered networks, annotated
@@ -1353,7 +2011,7 @@ std::vector<KnownNetwork> GetKnownNetworks()
     }
     LeaveCriticalSection(&g_cfgCs);
 
-    ScopedWlan wl(OpenWlan());
+    ScopedWlan wl(OpenWlan(true));
     if (wl.h) {
         for (const auto& i : EnumWlanIfaces(wl.h)) {
             PWLAN_PROFILE_INFO_LIST pl = nullptr;
@@ -1430,7 +2088,7 @@ bool ConnectToNetwork(const std::wstring& profile)
     return false;
 }
 
-// ---------------------------------------------------------------- device reset
+// ---------------------------------------------------------------- devices
 
 static std::wstring DevRegString(HDEVINFO devs, SP_DEVINFO_DATA* did, DWORD prop)
 {
@@ -1442,19 +2100,24 @@ static std::wstring DevRegString(HDEVINFO devs, SP_DEVINFO_DATA* did, DWORD prop
     return L"";
 }
 
-static std::wstring DevNetCfgInstanceId(HDEVINFO devs, SP_DEVINFO_DATA* did)
+static std::wstring DevDriverString(HDEVINFO devs, SP_DEVINFO_DATA* did, const wchar_t* value,
+                                    DWORD* dword = nullptr)
 {
-    std::wstring id;
+    std::wstring s;
     ScopedRegKey key(SetupDiOpenDevRegKey(devs, did, DICS_FLAG_GLOBAL, 0,
                                           DIREG_DRV, KEY_READ));
-    if (key.k != (HKEY)INVALID_HANDLE_VALUE) {
-        wchar_t buf[64] = {};
-        DWORD sz = sizeof buf - sizeof(wchar_t), type = 0;
-        if (RegQueryValueExW(key.k, L"NetCfgInstanceId", nullptr, &type,
-                             (PBYTE)buf, &sz) == ERROR_SUCCESS && type == REG_SZ)
-            id = buf;
-    }
-    return id;
+    if (key.k == (HKEY)INVALID_HANDLE_VALUE) return s;
+    BYTE buf[256] = {};
+    DWORD sz = sizeof buf - sizeof(wchar_t), type = 0;
+    if (RegQueryValueExW(key.k, value, nullptr, &type, buf, &sz) != ERROR_SUCCESS) return s;
+    if (type == REG_SZ) s = (const wchar_t*)buf;
+    else if (type == REG_DWORD && dword && sz >= sizeof(DWORD)) *dword = *(const DWORD*)buf;
+    return s;
+}
+
+static std::wstring DevNetCfgInstanceId(HDEVINFO devs, SP_DEVINFO_DATA* did)
+{
+    return DevDriverString(devs, did, L"NetCfgInstanceId");
 }
 
 static bool ChangeDevState(HDEVINFO devs, SP_DEVINFO_DATA* did, DWORD newState)
@@ -1481,6 +2144,123 @@ static bool LooksWireless(const std::wstring& descLower)
     for (const wchar_t* k : kInclude)
         if (descLower.find(k) != std::wstring::npos) return true;
     return false;
+}
+
+// Real hardware sits on a bus; software adapters (VPN, virtual switches, WAN
+// miniports, Wi-Fi Direct, Bluetooth PAN) are enumerated by software.
+static bool IsPhysicalInstance(const std::wstring& instanceId)
+{
+    std::wstring u = Lower(instanceId);
+    static const wchar_t* kSoft[] = { L"root\\", L"swd\\", L"bth", L"{", L"umb\\",
+                                      L"compositebus\\" };
+    for (const wchar_t* p : kSoft)
+        if (u.rfind(p, 0) == 0) return false;
+    return !u.empty();
+}
+
+struct NetDevice {
+    std::wstring id;          // NetCfgInstanceId
+    std::wstring name;        // connection name ("Wi-Fi"), else the device description
+    nv::Dev state = nv::Dev::Unknown;
+    unsigned problem = 0;
+    bool physical = false;
+    bool wireless = false;
+    bool cellular = false;
+};
+
+static std::vector<NetDevice> EnumNetDevices()
+{
+    std::vector<NetDevice> out;
+    ScopedDevInfo devInfo(SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr,
+                                               DIGCF_PRESENT));
+    if (devInfo.h == INVALID_HANDLE_VALUE) return out;
+    SP_DEVINFO_DATA did{};
+    did.cbSize = sizeof did;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo.h, i, &did); ++i) {
+        NetDevice d;
+        d.id = DevNetCfgInstanceId(devInfo.h, &did);
+        if (d.id.empty()) continue;
+        std::wstring desc = DevRegString(devInfo.h, &did, SPDRP_FRIENDLYNAME);
+        if (desc.empty()) desc = DevRegString(devInfo.h, &did, SPDRP_DEVICEDESC);
+        wchar_t inst[512] = {};
+        SetupDiGetDeviceInstanceIdW(devInfo.h, &did, inst, 512, nullptr);
+        d.physical = IsPhysicalInstance(inst) && !LooksVirtualAdapter(Lower(desc));
+        ULONG status = 0, problem = 0;
+        if (CM_Get_DevNode_Status(&status, &problem, did.DevInst, 0) == CR_SUCCESS) {
+            if (status & DN_HAS_PROBLEM) {
+                d.state = problem == CM_PROB_DISABLED ? nv::Dev::Disabled : nv::Dev::Failed;
+                d.problem = (unsigned)problem;
+            } else {
+                d.state = nv::Dev::Ok;
+            }
+        }
+        DWORD media = 0;
+        DevDriverString(devInfo.h, &did, L"*PhysicalMediaType", &media);
+        d.wireless = media == 9 || media == 1 || LooksWireless(Lower(desc)); // native 802.11 / WLAN
+        d.cellular = media == 8;                                           // wireless WAN
+        std::wstring conn = RegReadString(HKEY_LOCAL_MACHINE,
+            L"SYSTEM\\CurrentControlSet\\Control\\Network\\"
+            L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\" + d.id + L"\\Connection", L"Name");
+        d.name = conn.empty() ? desc : conn;
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+static bool DeviceOpHung(); // fwd
+
+// Device enumeration can stall while a wedged driver holds the PnP lock —
+// and then every further attempt would strand one more thread behind it.
+static std::vector<NetDevice> EnumNetDevicesBounded(DWORD ms)
+{
+    static std::shared_ptr<std::atomic<bool>> lastFinished;
+    if (DeviceOpHung() || (lastFinished && !*lastFinished)) return {};
+    auto finished = std::make_shared<std::atomic<bool>>(false);
+    auto out = std::make_shared<std::vector<NetDevice>>();
+    lastFinished = finished;
+    if (!RunBounded(ms, [out, finished] {
+            *out = EnumNetDevices();
+            *finished = true;
+        })) {
+        Logf(L"device enumeration did not finish in %u s — device manager busy?", ms / 1000);
+        return {};
+    }
+    return *out;
+}
+
+// Attach device state to IP adapters, and add adapters the IP stack cannot
+// see because they are disabled or their driver failed.
+static void MergeDevices(std::vector<nv::AdapterObs>& ads, const std::vector<NetDevice>& devs,
+                         const std::vector<std::wstring>& wlanGuids)
+{
+    for (const auto& d : devs) {
+        bool wlan = false;
+        for (const auto& g : wlanGuids)
+            if (_wcsicmp(g.c_str(), d.id.c_str()) == 0) wlan = true;
+        nv::AdapterObs* match = nullptr;
+        for (auto& a : ads)
+            if (_wcsicmp(a.id.c_str(), d.id.c_str()) == 0) match = &a;
+        if (match) {
+            match->dev = d.state;
+            match->problem = d.problem;
+            if (wlan && !match->virt) match->kind = nv::Kind::Wifi;
+            continue;
+        }
+        // A physical adapter the IP stack cannot see is a symptom when it is
+        // disabled or failed — or when it is Wi-Fi (a half-loaded driver
+        // WLAN AutoConfig no longer lists).
+        bool wifi = wlan || d.wireless;
+        if (!d.physical || d.state == nv::Dev::Unknown) continue;
+        if (d.state == nv::Dev::Ok && !wifi) continue;
+        nv::AdapterObs a;
+        a.name    = d.name;
+        a.id      = d.id;
+        a.hasIf   = false;
+        a.dev     = d.state;
+        a.problem = d.problem;
+        a.kind    = wifi ? nv::Kind::Wifi : d.cellular ? nv::Kind::Cellular : nv::Kind::Ethernet;
+        ads.push_back(std::move(a));
+    }
 }
 
 // A repeatedly-dying adapter (USB Wi-Fi especially) is often being powered
@@ -1511,63 +2291,155 @@ static void DisableAdapterPowerSaving(HDEVINFO devs, SP_DEVINFO_DATA* did,
          desc.c_str(), rc);
 }
 
-// Disable/enable Wi-Fi adapters (a driver-level reset). If targetIds is
-// empty — the adapter vanished from WlanSvc — fall back to resetting present
-// net-class devices that look wireless. When fixPower is set, also stop
-// Windows from powering the adapter down. Returns how many were reset.
-static int ResetWifiAdapters(const std::vector<std::wstring>& targetIds, bool fixPower)
+struct DevOpResult {
+    bool found = false;
+    bool ok = false;
+    bool needReboot = false;
+    DWORD error = 0;
+};
+
+// Disable+enable (a driver-level reset) or just enable one net device.
+// Runs on a RunBounded helper, so it opens its own device list.
+static DevOpResult DeviceOp(const std::wstring& id, bool cycle, bool fixPower,
+                            const std::wstring& name)
 {
-    int resetCount = 0;
+    DevOpResult r;
     ScopedDevInfo devInfo(SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr,
                                                DIGCF_PRESENT));
-    HDEVINFO devs = devInfo.h;
-    if (devs == INVALID_HANDLE_VALUE) {
-        Logf(L"SetupDiGetClassDevs failed (%u)", GetLastError());
-        return 0;
+    if (devInfo.h == INVALID_HANDLE_VALUE) {
+        r.error = GetLastError();
+        return r;
     }
     SP_DEVINFO_DATA did{};
     did.cbSize = sizeof did;
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(devs, i, &did); ++i) {
-        std::wstring id   = DevNetCfgInstanceId(devs, &did);
-        std::wstring desc = DevRegString(devs, &did, SPDRP_FRIENDLYNAME);
-        if (desc.empty()) desc = DevRegString(devs, &did, SPDRP_DEVICEDESC);
-
-        bool match = false;
-        if (!targetIds.empty()) {
-            for (const auto& t : targetIds)
-                if (!id.empty() && _wcsicmp(t.c_str(), id.c_str()) == 0) match = true;
-        } else {
-            match = LooksWireless(Lower(desc));
-        }
-        if (!match) continue;
-
-        Logf(L"resetting adapter driver: %ls", desc.c_str());
-        if (!ChangeDevState(devs, &did, DICS_DISABLE)) {
-            Logf(L"  disable failed (%u)", GetLastError());
-            continue;
-        }
-        if (fixPower)
-            DisableAdapterPowerSaving(devs, &did, desc); // applies on the enable
-        Sleep(3000);
-        if (!ChangeDevState(devs, &did, DICS_ENABLE)) {
-            Logf(L"  enable failed (%u) — retrying", GetLastError());
-            Sleep(2000);
-            if (!ChangeDevState(devs, &did, DICS_ENABLE)) {
-                Logf(L"  enable failed again (%u) — adapter may need a re-plug",
-                     GetLastError());
-                continue;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo.h, i, &did); ++i) {
+        if (_wcsicmp(DevNetCfgInstanceId(devInfo.h, &did).c_str(), id.c_str()) != 0) continue;
+        r.found = true;
+        if (cycle) {
+            if (!ChangeDevState(devInfo.h, &did, DICS_DISABLE)) {
+                r.error = GetLastError();
+                break;
             }
+            if (fixPower) DisableAdapterPowerSaving(devInfo.h, &did, name);
+            Sleep(3000);
         }
-        ++resetCount;
+        r.ok = ChangeDevState(devInfo.h, &did, DICS_ENABLE);
+        if (!r.ok) {
+            Sleep(2000);
+            r.ok = ChangeDevState(devInfo.h, &did, DICS_ENABLE);
+        }
+        if (!r.ok) r.error = GetLastError();
+        SP_DEVINSTALL_PARAMS_W ip{};
+        ip.cbSize = sizeof ip;
+        if (SetupDiGetDeviceInstallParamsW(devInfo.h, &did, &ip))
+            r.needReboot = (ip.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART)) != 0;
+        break;
     }
-    if (resetCount) {
-        Logf(L"%d adapter(s) reset — waiting for driver re-init", resetCount);
-        WaitStop(8000);
-    }
-    return resetCount;
+    return r;
 }
 
-// ---------------------------------------------------------------- WlanSvc
+// A device operation that never returned: the driver is hung inside the PnP
+// manager, and further device operations would just pile up behind it.
+static std::shared_ptr<std::atomic<bool>> g_hungDevOp;
+
+static bool DeviceOpHung() { return g_hungDevOp && !*g_hungDevOp; }
+
+static void AdviseRestart(const std::wstring& detail); // fwd
+
+static bool RunDeviceOp(const nv::AdapterObs& a, bool cycle, bool fixPower)
+{
+    auto finished = std::make_shared<std::atomic<bool>>(false);
+    auto result = std::make_shared<DevOpResult>();
+    std::wstring id = a.id, name = a.name;
+    bool done = RunBounded(90000, [=] {
+        *result = DeviceOp(id, cycle, fixPower, name);
+        *finished = true;
+    });
+    if (!done) {
+        g_hungDevOp = finished;
+        Logf(L"  [%ls] the driver did not respond within 90 s — it is hung; only a Windows "
+             L"restart can recover it", a.name.c_str());
+        AdviseRestart(L"the driver for '" + a.name + L"' is hung — restart Windows to recover "
+                      L"the network adapter");
+        return false;
+    }
+    if (!result->found) {
+        Logf(L"  [%ls] device not found (unplugged?)", a.name.c_str());
+        return false;
+    }
+    if (!result->ok) {
+        Logf(L"  [%ls] %ls failed (%u) — the adapter may need a re-plug", a.name.c_str(),
+             cycle ? L"driver reset" : L"enable", result->error);
+        return false;
+    }
+    if (result->needReboot) {
+        Logf(L"  [%ls] Windows reports a restart is needed to finish this", a.name.c_str());
+        AdviseRestart(L"'" + a.name + L"' needs Windows to restart before it works again");
+    }
+    return true;
+}
+
+static int EffectiveResets(const std::wstring& id) { return IniCount(L"resets", id); }
+
+static bool ResetAdapterDevice(const nv::AdapterObs& a)
+{
+    // Evidence-based power fix: resets that actually revived this adapter
+    // twice mean Windows keeps powering it down (USB selective suspend).
+    bool fixPower = EffectiveResets(a.id) >= 2;
+    Logf(L"  [%ls] resetting the adapter driver (disable + enable)", a.name.c_str());
+    if (!RunDeviceOp(a, /*cycle=*/true, fixPower)) return false;
+    Logf(L"  [%ls] adapter reset — waiting for the driver to re-initialise", a.name.c_str());
+    WaitStop(8000);
+    return true;
+}
+
+static bool EnableAdapterDevice(const nv::AdapterObs& a)
+{
+    if (!RunDeviceOp(a, /*cycle=*/false, false)) return false;
+    Logf(L"  [%ls] adapter enabled", a.name.c_str());
+    return true;
+}
+
+// "Scan for hardware changes": brings back devices that dropped off the bus
+// (a USB Wi-Fi dongle after a power glitch) without a re-plug.
+static bool RescanHardware()
+{
+    auto rc = std::make_shared<std::atomic<int>>((int)CR_FAILURE);
+    bool done = RunBounded(30000, [rc] {
+        DEVINST root = 0;
+        CONFIGRET cr = CM_Locate_DevNodeW(&root, nullptr, CM_LOCATE_DEVNODE_NORMAL);
+        if (cr == CR_SUCCESS) cr = CM_Reenumerate_DevNode(root, CM_REENUMERATE_SYNCHRONOUS);
+        *rc = (int)cr;
+    });
+    if (!done) {
+        Logf(L"  hardware rescan still running after 30 s — continuing");
+        return true;
+    }
+    Logf(*rc == (int)CR_SUCCESS ? L"  rescanned for hardware changes"
+                                : L"  hardware rescan failed (CONFIGRET %d)", (int)*rc);
+    return *rc == (int)CR_SUCCESS;
+}
+
+// ---------------------------------------------------------------- services
+
+static bool StartServiceAndWait(SC_HANDLE scm, const wchar_t* name, DWORD ms)
+{
+    ScopedSvc svc(OpenServiceW(scm, name, SERVICE_START | SERVICE_QUERY_STATUS));
+    if (!svc.h) {
+        Logf(L"  OpenService(%ls) failed (%u)", name, GetLastError());
+        return false;
+    }
+    if (!StartServiceW(svc.h, 0, nullptr) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
+        Logf(L"  StartService(%ls) failed (%u)", name, GetLastError());
+        return false;
+    }
+    SERVICE_STATUS ss{};
+    ULONGLONG end = GetTickCount64() + ms;
+    while (QueryServiceStatus(svc.h, &ss) && ss.dwCurrentState != SERVICE_RUNNING &&
+           GetTickCount64() < end)
+        Sleep(500);
+    return ss.dwCurrentState == SERVICE_RUNNING;
+}
 
 static bool StartOrRestartWlanSvc(bool forceRestart)
 {
@@ -1624,140 +2496,598 @@ static bool StartOrRestartWlanSvc(bool forceRestart)
     return ok;
 }
 
-// ---------------------------------------------------------------- remediation
+// Services the network stack cannot work without.
+struct NetService {
+    const wchar_t* name;
+    const wchar_t* label;
+};
+static const NetService kNsi  = { L"nsi",     L"Network Store Interface" };
+static const NetService kDhcp = { L"Dhcp",    L"DHCP Client" };
+static const NetService kWlan = { L"WlanSvc", L"WLAN AutoConfig" };
 
-// Driver resets that were followed by connectivity coming back — evidence
-// that the adapter keeps dying and the reset is what revives it. Two of
-// those justify the persistent power-management fix; futile resets (AP down,
-// ISP out) never count.
-static int g_effectiveResets = 0;
-
-static ULONGLONG kDhcpRenewCooldownMs = 10ull * 60 * 1000;
-static ULONGLONG g_lastDhcpRenew = 0;
-
-// Escalating repair. Returns connectivity state afterwards.
-static Net Remediate(Net current, ULONGLONG& lastResetTick)
+// 1 running, 0 stopped (startable), -1 disabled, -2 unknown.
+static int ServiceState(SC_HANDLE scm, const wchar_t* name)
 {
-    // Stage 0: IP-layer triage BEFORE touching the association, so a healthy
-    // link is never bounced when the problem is not the Wi-Fi link at all.
-    bool upstreamSuspected = false;
-    {
-        std::vector<AdapterIpInfo> ads = SnapshotAdapters();
-        bool renewed = false;
-        for (const auto& a : ads) {
-            if (!a.up || a.virt || !a.dhcp) continue;
-            // A gateway-less lease is only "broken" on Wi-Fi — wired subnets
-            // can legitimately have no default route (NAS/lab links).
-            bool broken = !a.hasIpv4 || a.apipa || (a.wireless && !a.hasGateway);
-            if (!broken) continue;
-            Logf(L"[%ls] broken IP configuration (%ls)", a.name.c_str(),
-                 !a.hasIpv4 ? L"no IPv4 address"
-                            : a.apipa ? L"APIPA self-assigned address"
-                                      : L"no default gateway");
-            if (!g_elevated) {
-                Logf(L"  DHCP repair skipped: not elevated");
-                continue;
-            }
-            ULONGLONG now = GetTickCount64();
-            if (g_lastDhcpRenew != 0 && now - g_lastDhcpRenew < kDhcpRenewCooldownMs) {
-                Logf(L"  DHCP repair skipped: cooldown");
-                continue;
-            }
-            g_lastDhcpRenew = now;
-            renewed = RenewDhcp(a.ifIndex, a.name) || renewed;
+    ScopedSvc svc(OpenServiceW(scm, name, SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG));
+    if (!svc.h) return -2;
+    SERVICE_STATUS ss{};
+    if (!QueryServiceStatus(svc.h, &ss)) return -2;
+    if (ss.dwCurrentState == SERVICE_RUNNING || ss.dwCurrentState == SERVICE_START_PENDING ||
+        ss.dwCurrentState == SERVICE_CONTINUE_PENDING)
+        return 1;
+    DWORD need = 0;
+    QueryServiceConfigW(svc.h, nullptr, 0, &need);
+    if (need) {
+        std::vector<BYTE> buf(need);
+        auto* cfg = (QUERY_SERVICE_CONFIGW*)buf.data();
+        if (QueryServiceConfigW(svc.h, cfg, need, &need) && cfg->dwStartType == SERVICE_DISABLED)
+            return -1;
+    }
+    return 0;
+}
+
+static std::vector<const NetService*> RelevantServices(bool wifi, bool dhcp)
+{
+    std::vector<const NetService*> v = { &kNsi };
+    if (dhcp) v.push_back(&kDhcp);
+    if (wifi) v.push_back(&kWlan);
+    return v;
+}
+
+static bool g_obsWifi = false, g_obsDhcp = false; // what the last observation needed
+
+static void ObserveServices(nv::Observation& o, bool wifi, bool dhcp)
+{
+    g_obsWifi = wifi;
+    g_obsDhcp = dhcp;
+    ScopedSvc scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm.h) return;
+    for (const NetService* s : RelevantServices(wifi, dhcp)) {
+        int st = ServiceState(scm.h, s->name);
+        if (s == &kWlan) {                 // only the Wi-Fi path needs it
+            o.wifi.serviceStopped  = st == 0;
+            o.wifi.serviceDisabled = st == -1;
+        } else if (st == 0) {
+            o.stoppedServices.push_back(s->label);
+        } else if (st == -1) {
+            o.disabledServices.push_back(s->label);
         }
-        if (renewed) {
-            if (WaitStop(3000)) return current;
-            Net r = CheckInternet();
-            Logf(L"after DHCP repair: %ls", NetToStr(r));
-            if (r != Net::Offline) return r;
+    }
+}
+
+static bool StartStoppedServices()
+{
+    ScopedSvc scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm.h) return false;
+    bool any = false;
+    for (const NetService* s : RelevantServices(g_obsWifi, g_obsDhcp)) {
+        if (ServiceState(scm.h, s->name) != 0) continue;
+        bool ok = StartServiceAndWait(scm.h, s->name, 20000);
+        Logf(ok ? L"  %ls started" : L"  %ls did not start", s->label);
+        any = any || ok;
+    }
+    return any;
+}
+
+static bool ResyncClock()
+{
+    ScopedSvc scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (scm.h) {
+        int st = ServiceState(scm.h, L"W32Time");
+        if (st == -1) {
+            Logf(L"  the Windows Time service is disabled — cannot resync");
+            return false;
         }
-        upstreamSuspected = WifiGatewayAlive();
-        if (upstreamSuspected)
-            Logf(L"Wi-Fi gateway responds while the internet is down — "
-                 L"upstream/ISP outage suspected; keeping the current association");
+        if (st == 0 && !StartServiceAndWait(scm.h, L"W32Time", 15000)) return false;
     }
+    DWORD rc = RunProcess(L"\"" + Sys32(L"w32tm.exe") + L"\" /resync /rediscover", true);
+    Logf(rc == 0 ? L"  clock resync done" : L"  clock resync failed (w32tm exit %u)", rc);
+    return rc == 0;
+}
 
-    // Stage 1: rejoin Wi-Fi. Behind a captive portal or during an upstream
-    // outage the association itself is fine — only attach disconnected
-    // interfaces instead of bouncing a good one.
-    Logf(L"remediation stage 1: Wi-Fi reconnect");
-    WifiReconnectAll(/*bounceIfConnected=*/current != Net::Portal && !upstreamSuspected);
-    if (WaitStop(5000)) return current;
-    Net n = CheckInternet();
-    Logf(L"after stage 1: %ls", NetToStr(n));
-    if (n == Net::Online || n == Net::Degraded) return n;
-    if (n == Net::Portal) {
-        Logf(L"captive portal suspected — driver reset would not help; "
-             L"complete the portal sign-in in a browser");
-        return n;
-    }
+// ---------------------------------------------------------------- observe
 
-    // If the Wi-Fi path's own gateway answers, the driver is fine and the
-    // outage is upstream — resetting hardware cannot bring the internet back.
-    if (StopRequested()) return n;
-    if (WifiGatewayAlive()) {
-        Logf(L"upstream/ISP outage — skipping driver reset, retrying on the "
-             L"short interval");
-        return n;
-    }
+// Everything the diagnosis looks at, gathered fresh. When the web answers
+// (online, or a portal) the probe results are all it needs.
+static nv::Observation Observe(const Connectivity& c, int failStreak, bool full)
+{
+    nv::Observation o;
+    o.failStreak    = failStreak;
+    o.allowFailover = GetFailover();
+    nv::ProbeObs& p = o.probe;
+    p.httpOk       = c.httpOk;
+    p.httpAnswered = c.httpAnswered;
+    p.pingOk       = c.pingOk;
+    p.tcpOk        = c.tcpOk;
+    p.clockKnown   = c.clockKnown;
+    p.clockSkew    = c.clockSkew;
+    if (!full && (c.httpOk || c.httpAnswered)) return o;
 
-    // Stage 2: driver-level reset.
-    if (StopRequested()) return n;
-    if (!g_elevated) {
-        Logf(L"stage 2 skipped: not elevated — cannot reset adapters or restart WlanSvc");
-        return n;
+    bool ipReach = c.pingOk || c.tcpOk;
+    o.adapters = SnapshotAdapters();
+    std::vector<std::wstring> wlanGuids;
+    ObserveWlan(o.wifi, wlanGuids, /*scanIfIdle=*/!ipReach);
+    MergeDevices(o.adapters, EnumNetDevicesBounded(10000), wlanGuids);
+    MarkRouteAdapter(o.adapters);
+
+    bool anyDhcp = false;
+    for (const auto& a : o.adapters) {
+        if (a.virt) continue;
+        if (a.kind == nv::Kind::Wifi) o.wifi.hardware = true;
+        if (a.dhcp) anyDhcp = true;
     }
+    if (o.wifi.interfaces > 0) o.wifi.hardware = true;
+    if (o.wifi.hardware) RememberWifiSeen();
+    o.wifi.expected = o.wifi.hardware || WifiSeenRecently();
+    o.wifi.airplane = AirplaneModeOn();
+    ObserveServices(o, o.wifi.hardware, anyDhcp);
+
+    if (ipReach || full) {
+        // Above IP: name resolution and the proxy.
+        p.dnsOk = SystemDnsWorks(6000);
+        int route = -1;
+        for (size_t i = 0; i < o.adapters.size(); ++i)
+            if (o.adapters[i].routesInternet) route = (int)i;
+        std::vector<uint32_t> servers;
+        if (route >= 0) servers = o.adapters[(size_t)route].dnsIps;
+        size_t own = servers.size();
+        servers.push_back(Ipv4("1.1.1.1"));
+        servers.push_back(Ipv4("8.8.8.8"));
+        std::vector<bool> alive = DnsServersAnswer(servers, 2000);
+        if (route >= 0) {
+            int dead = 0;
+            for (size_t i = 0; i < own; ++i) dead += alive[i] ? 0 : 1;
+            o.adapters[(size_t)route].dnsDead = dead;
+        }
+        p.dnsPublicOk = alive[own] || alive[own + 1];
+        ObserveProxy(p);
+    }
+    if (!ipReach || full) {
+        // Below: is each physical link's router there? The routing adapter
+        // first; the others matter for telling a dead VPN from a dead LAN.
+        std::vector<size_t> order;
+        for (size_t i = 0; i < o.adapters.size(); ++i) {
+            if (o.adapters[i].routesInternet) order.insert(order.begin(), i);
+            else order.push_back(i);
+        }
+        int probed = 0;
+        for (size_t i : order) {
+            nv::AdapterObs& a = o.adapters[i];
+            if (probed >= 3) break;
+            if (a.virt || !a.hasIf || !a.up || !a.hasGateway) continue;
+            a.gateway = ProbeGateway(a);
+            ++probed;
+        }
+    }
+    return o;
+}
+
+static const wchar_t* KindStr(nv::Kind k)
+{
+    switch (k) {
+    case nv::Kind::Wifi:     return L"Wi-Fi";
+    case nv::Kind::Ethernet: return L"Ethernet";
+    case nv::Kind::Cellular: return L"cellular";
+    default:                 return L"other";
+    }
+}
+
+static void LogObservation(const nv::Observation& o)
+{
+    const nv::ProbeObs& p = o.probe;
+    Logf(L"  observed: web %ls, ping %ls, tcp %ls%ls",
+         p.httpOk ? L"ok" : p.httpAnswered ? L"wrong answer" : L"no answer",
+         p.pingOk ? L"ok" : L"no",
+         p.tcpOk ? L"ok" : (p.pingOk || p.httpOk || p.httpAnswered) ? L"not needed" : L"no",
+         g_hintLevel == 3 ? L", Windows says: internet"
+         : g_hintLevel == 2 ? L", Windows says: local network only"
+         : g_hintLevel == 1 ? L", Windows says: no connectivity"
+         : g_hintLevel == 4 ? L", Windows says: limited (sign-in?)" : L"");
+    for (const auto& a : o.adapters) {
+        if (a.virt && !a.routesInternet) continue;
+        if (a.hasIf && !a.up && a.kind != nv::Kind::Wifi && a.dev != nv::Dev::Failed) continue;
+        std::wstring dev = a.dev == nv::Dev::Disabled ? L"DISABLED, "
+                         : a.dev == nv::Dev::Failed
+                               ? L"DRIVER PROBLEM (code " + std::to_wstring(a.problem) + L"), "
+                               : L"";
+        std::wstring link = !a.hasIf ? L"no IP interface"
+                          : a.kind == nv::Kind::Wifi ? (a.media ? L"associated" : L"not associated")
+                          : (a.media ? L"link up" : L"no link");
+        std::wstring gw = !a.hasGateway ? L"none"
+                        : a.gw + (a.gateway == 1 ? L" (answers)" : a.gateway == 0 ? L" (silent)" : L"");
+        Logf(L"  [%ls] %ls%ls%ls: %ls%ls, ip %ls%ls%ls, gw %ls, dns %ls%ls%ls",
+             a.name.c_str(), KindStr(a.kind), a.virt ? L" (virtual)" : L"",
+             a.routesInternet ? L", ROUTE" : L"", dev.c_str(), link.c_str(),
+             a.hasIpv4 ? a.ip.c_str() : L"none", a.apipa ? L" (APIPA — DHCP failed)" : L"",
+             a.duplicate ? L" (ADDRESS CONFLICT)" : L"", gw.c_str(),
+             DnsListStr(a.dnsIps).c_str(), a.staticDns ? L" (set by hand)" : L"",
+             a.dnsDead > 0 ? (L" (" + std::to_wstring(a.dnsDead) + L" silent)").c_str() : L"");
+    }
+    const nv::WifiObs& w = o.wifi;
+    if (w.hardware || w.expected)
+        Logf(L"  Wi-Fi: %d interface%ls, %ls, radio %ls%ls, %d network%ls visible, %d saved "
+             L"in range%ls%ls",
+             w.interfaces, w.interfaces == 1 ? L"" : L"s",
+             w.associated ? L"associated" : L"not associated",
+             w.radioHardOff ? L"OFF (hardware switch)" : w.radioSoftOff ? L"off" : L"on",
+             w.airplane ? L", AIRPLANE MODE" : L"", w.visible < 0 ? 0 : w.visible,
+             w.visible == 1 ? L"" : L"s", w.knownInRange,
+             w.authFailed.empty() ? L"" : (L", password rejected: " + w.authFailed).c_str(),
+             w.hardware ? L"" : L", ADAPTER MISSING");
+    std::vector<std::wstring> stopped = o.stoppedServices, disabled = o.disabledServices;
+    if (w.serviceStopped) stopped.push_back(kWlan.label);
+    if (w.serviceDisabled) disabled.push_back(kWlan.label);
+    if (!stopped.empty() || !disabled.empty()) {
+        std::wstring s;
+        for (const auto& n : stopped) s += (s.empty() ? L"" : L", ") + n + L" stopped";
+        for (const auto& n : disabled) s += (s.empty() ? L"" : L", ") + n + L" DISABLED";
+        Logf(L"  services: %ls", s.c_str());
+    }
+    if (p.pingOk || p.tcpOk)
+        Logf(L"  dns: system resolver %ls, public DNS %ls", p.dnsOk ? L"ok" : L"FAILING",
+             p.dnsPublicOk ? L"answers" : L"silent");
+    if (p.proxyOn)
+        Logf(L"  proxy: %ls%ls", p.proxy.c_str(),
+             p.proxyDead ? L" — nothing is listening there"
+                         : p.directOk ? L" — direct connections work" : L"");
+}
+
+// ---------------------------------------------------------------- repair
+
+static std::map<std::wstring, ULONGLONG> g_lastRun;   // step key -> tick it last ran
+static unsigned long long g_advised = 0;              // faults already told this episode
+static std::wstring g_lastDiagKey;
+static ULONGLONG g_lastDiagTick = 0;
+
+static ULONGLONG ActCooldownMs(nv::Act a)
+{
+    const ULONGLONG minute = 60ull * 1000;
+    switch (a) {
+    case nv::Act::ResetAdapter:
+    case nv::Act::RestartWlanSvc: return kResetCooldownMs;
+    case nv::Act::RenewDhcp:      return 10 * minute;
+    case nv::Act::RescanDevices:  return 10 * minute;
+    case nv::Act::SwitchNetwork:  return 20 * minute;
+    case nv::Act::FlushDns:
+    case nv::Act::FlushArp:
+    case nv::Act::EnableAdapter:  return 5 * minute;
+    case nv::Act::StartServices:  return 2 * minute;
+    case nv::Act::ResyncClock:    return 6 * 60 * minute;
+    default:                      return 0;   // Wi-Fi (re)connects, radio, proxy
+    }
+}
+
+
+// Time for a repair to take effect before connectivity is re-checked.
+static DWORD ActSettleMs(nv::Act a)
+{
+    switch (a) {
+    case nv::Act::EnableAdapter:
+    case nv::Act::RescanDevices:  return 8000;
+    case nv::Act::StartServices:
+    case nv::Act::RestartWlanSvc: return 5000;
+    case nv::Act::RenewDhcp:
+    case nv::Act::ResetAdapter:   return 3000;
+    default:                      return 1500;
+    }
+}
+
+static std::wstring StepText(const nv::Step& s, const nv::Observation& o)
+{
+    std::wstring t = nv::ActName(s.act);
+    if (s.adapter >= 0 && (size_t)s.adapter < o.adapters.size())
+        t += L" on '" + o.adapters[(size_t)s.adapter].name + L"'";
+    return t;
+}
+
+static std::wstring StepKey(const nv::Step& s, const nv::Observation& o)
+{
+    std::wstring k = nv::ActKey(s.act);
+    if (s.adapter >= 0 && (size_t)s.adapter < o.adapters.size())
+        k += L":" + o.adapters[(size_t)s.adapter].id;
+    return k;
+}
+
+static void PublishDiagnosis(const nv::Diagnosis& d)
+{
+    UpdateState([&](MonitorState& s) {
+        s.fault           = (int)d.fault;
+        s.faultNeedsUser  = d.userAction;
+        s.diagnosis       = d.fault == nv::Fault::None ? L"" : nv::FaultName(d.fault);
+        s.diagnosisDetail = d.fault == nv::Fault::None ? L"" : d.detail;
+    });
+}
+
+static void ClearDiagnosis()
+{
+    g_advised = 0;
+    g_lastDiagKey.clear();
+    UpdateState([](MonitorState& s) {
+        s.fault = 0;
+        s.faultNeedsUser = false;
+        s.diagnosis.clear();
+        s.diagnosisDetail.clear();
+    });
+}
+
+// Tell the user once per outage about a fault only they can finish fixing.
+static void Advise(const nv::Diagnosis& d)
+{
+    if (!d.userAction) return;
+    unsigned long long bit = 1ull << (unsigned)d.fault;
+    if (g_advised & bit) return;
+    g_advised |= bit;
+    NotifyUi(UiAdvice, (LPARAM)d.fault);
+}
+
+static void AdviseRestart(const std::wstring& detail)
+{
+    nv::Diagnosis d;
+    d.fault = nv::Fault::AdapterFailed;
+    d.userAction = true;
+    d.detail = detail;
+    PublishDiagnosis(d);
+    Advise(d);
+}
+
+static void LogDiagnosis(const nv::Diagnosis& d, const nv::Observation& o)
+{
+    if (d.fault == nv::Fault::None) {
+        Logf(L"diagnosis: healthy — nothing to repair");
+        return;
+    }
+    Logf(L"diagnosis: %ls — %ls", nv::FaultName(d.fault), d.detail.c_str());
+    if (d.plan.empty()) {
+        Logf(L"  no repair applies from this computer%ls",
+             d.userAction ? L" — this needs a person" : L"");
+        return;
+    }
+    std::wstring plan;
+    for (const auto& s : d.plan) {
+        if (!plan.empty()) plan += L" → ";
+        plan += StepText(s, o);
+    }
+    Logf(L"  plan: %ls", plan.c_str());
+}
+
+static void ReportDiagnosis(const nv::Diagnosis& d, const nv::Observation& o)
+{
+    PublishDiagnosis(d);
+    std::wstring key = std::to_wstring((int)d.fault) + L"|" + d.detail;
     ULONGLONG now = GetTickCount64();
-    if (lastResetTick != 0 && now - lastResetTick < kResetCooldownMs) {
-        Logf(L"stage 2 skipped: last driver reset was %llu min ago (cooldown %llu min)",
-             (now - lastResetTick) / 60000ull, kResetCooldownMs / 60000ull);
-        return n;
+    if (key != g_lastDiagKey || now - g_lastDiagTick > 30ull * 60 * 1000) {
+        g_lastDiagKey = key;
+        g_lastDiagTick = now;
+        LogObservation(o);
+        LogDiagnosis(d, o);
+    } else {
+        Logf(L"diagnosis unchanged: %ls", nv::FaultName(d.fault));
     }
-    lastResetTick = now;
+    Advise(d);
+}
 
-    Logf(L"remediation stage 2: Wi-Fi adapter driver reset");
-    std::vector<std::wstring> ids = CurrentWlanAdapterIds();
-    int cnt = ResetWifiAdapters(ids, g_effectiveResets >= 2);
-    if (cnt == 0) {
-        Logf(L"no adapter could be reset — restarting WlanSvc instead");
-        StartOrRestartWlanSvc(true);
-    }
-    if (WaitStop(3000)) return n;
-    WifiReconnectAll(true);
-    if (WaitStop(5000)) return n;
-    n = CheckInternet();
-    Logf(L"after stage 2: %ls", NetToStr(n));
-    if (cnt > 0 && n != Net::Offline) ++g_effectiveResets; // the reset worked
-    if (n == Net::Online || n == Net::Degraded || n == Net::Portal) return n;
+static void RecordFix(const nv::Step& s, const nv::Observation& o, const nv::Diagnosis& d)
+{
+    std::wstring what = StepText(s, o);
+    Logf(L"fixed by: %ls (%ls)", what.c_str(), nv::FaultName(d.fault));
+    IniBump(L"repairs", nv::ActKey(s.act));
+    if (s.act == nv::Act::ResetAdapter && s.adapter >= 0)
+        IniBump(L"resets", o.adapters[(size_t)s.adapter].id);
+    long long now = (long long)_time64(nullptr);
+    UpdateState([&](MonitorState& st) {
+        st.lastRepair = what + L" (" + nv::FaultName(d.fault) + L")";
+        st.lastRepairAt = now;
+    });
+}
 
-    // Stage 3: WlanSvc restart as the last resort (unless it was just done).
-    if (cnt > 0 && !StopRequested()) {
-        Logf(L"remediation stage 3: restarting WlanSvc");
-        StartOrRestartWlanSvc(true);
-        if (WaitStop(5000)) return n;
-        WifiReconnectAll(true);
-        if (WaitStop(5000)) return n;
-        n = CheckInternet();
-        Logf(L"after stage 3: %ls", NetToStr(n));
+// Runs one repair step. True if it actually did something worth verifying.
+static bool Execute(const nv::Step& s, const nv::Observation& o)
+{
+    const nv::AdapterObs* ad =
+        s.adapter >= 0 && (size_t)s.adapter < o.adapters.size() ? &o.adapters[(size_t)s.adapter]
+                                                               : nullptr;
+    std::wstring what = StepText(s, o);
+    if (nv::ActNeedsAdmin(s.act) && !g_elevated) {
+        Logf(L"  skipped: %ls (needs admin rights — install NetVigil at startup)", what.c_str());
+        return false;
     }
-    return n;
+    std::wstring key = StepKey(s, o);
+    ULONGLONG now = GetTickCount64(), cooldown = ActCooldownMs(s.act);
+    auto last = g_lastRun.find(key);
+    if (cooldown && last != g_lastRun.end() && now - last->second < cooldown) {
+        Logf(L"  skipped: %ls (ran %llu min ago; at most every %llu min)", what.c_str(),
+             (now - last->second) / 60000ull, cooldown / 60000ull);
+        return false;
+    }
+    bool deviceOp = s.act == nv::Act::ResetAdapter || s.act == nv::Act::EnableAdapter ||
+                    s.act == nv::Act::RescanDevices;
+    if (deviceOp && DeviceOpHung()) {
+        Logf(L"  skipped: %ls (an earlier device operation is still hung)", what.c_str());
+        return false;
+    }
+    g_lastRun[key] = now;
+    Logf(L"repair: %ls", what.c_str());
+    UpdateState([&](MonitorState& st) { st.lastAction = L"trying: " + what; });
+    switch (s.act) {
+    case nv::Act::StartServices:  return StartStoppedServices();
+    case nv::Act::EnableAdapter:  return ad && EnableAdapterDevice(*ad);
+    case nv::Act::RescanDevices:  return RescanHardware();
+    case nv::Act::RadioOn:        return RadioOnAll();
+    case nv::Act::ConnectWifi:    return WifiReconnectAll(false);
+    case nv::Act::Reassociate:    return WifiReconnectAll(true);
+    case nv::Act::SwitchNetwork:  return SwitchWifiNetwork();
+    case nv::Act::RenewDhcp:      return ad && RenewDhcp(ad->ifIndex, ad->name);
+    case nv::Act::FlushArp:       return ad && FlushArpCache(ad->ifIndex, ad->name);
+    case nv::Act::FlushDns:       FlushDnsCache(); return true;
+    case nv::Act::DisableProxy:   return DisableDeadProxy(o.probe);
+    case nv::Act::ResetAdapter:   return ad && ResetAdapterDevice(*ad);
+    case nv::Act::RestartWlanSvc: return StartOrRestartWlanSvc(true);
+    case nv::Act::ResyncClock:    return ResyncClock();
+    default:                      return false;
+    }
+}
+
+// Observe -> diagnose -> repair, re-diagnosing when a plan runs out (the
+// situation changes as repairs land: an enabled adapter still has to
+// associate, a started service still has to connect).
+static Net RunRepairs(Connectivity c, int failStreak, int maxRounds)
+{
+    std::set<std::wstring> done; // steps already run in this call
+    for (int round = 0; round < maxRounds && !StopRequested(); ++round) {
+        Net start = c.verdict;
+        nv::Observation o = Observe(c, failStreak, false);
+        nv::Diagnosis d = nv::Diagnose(o);
+        ReportDiagnosis(d, o);
+        if (d.fault == nv::Fault::None) return c.verdict;
+
+        nv::PlanRun run = nv::RunPlan(
+            d.plan, done,
+            [&](const nv::Step& s) { return StepKey(s, o); },
+            [] { return StopRequested(); },
+            [&](const nv::Step& s) { return Execute(s, o); },
+            [&](const nv::Step& principal) {
+                if (WaitStop(ActSettleMs(principal.act))) return nv::Verdict::Abort;
+                c = Probe();
+                Logf(L"  -> %ls", NetToStr(c.verdict));
+                // Only progress counts: from offline, getting IP back (even
+                // with DNS still failing) does; from degraded, only online.
+                if (c.verdict == Net::Online ||
+                    (c.verdict == Net::Degraded && start != Net::Degraded)) {
+                    RecordFix(principal, o, d);
+                    return nv::Verdict::Fixed;
+                }
+                // Behind a sign-in page now: nothing more to repair here.
+                return c.verdict == Net::Portal ? nv::Verdict::Abort : nv::Verdict::Continue;
+            });
+        if (run.fixedBy >= 0 && c.verdict == Net::Online) break;
+        if (run.fixedBy >= 0) continue;  // IP is back, web/DNS still fail: diagnose that
+        if (run.aborted || !run.acted) break;
+    }
+    return c.verdict;
+}
+
+// Degraded (the internet answers by IP, web requests fail): diagnosis-driven
+// repair above the IP layer only. Rate-limited; cooldowns do the rest.
+static Net RepairDegraded(const Connectivity& c)
+{
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (last && now - last < 10ull * 60 * 1000) return Net::Degraded;
+    last = now;
+    return RunRepairs(c, 0, 1);
+}
+
+// Online, but the clock is far off — HTTPS certificate checks fail.
+static void RepairClock(const Connectivity& c)
+{
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (last && now - last < 6ull * 3600 * 1000) return;
+    last = now;
+    nv::Observation o = Observe(c, 0, false);
+    nv::Diagnosis d = nv::Diagnose(o);
+    if (d.fault != nv::Fault::ClockSkew) return;
+    ReportDiagnosis(d, o);
+    for (const auto& s : d.plan) Execute(s, o);
+    if (WaitStop(5000)) return;
+    Connectivity after = Probe();
+    if (after.clockKnown && llabs(after.clockSkew) < nv::kClockSkewLimitSec) {
+        RecordFix(d.plan.front(), o, d);
+        ClearDiagnosis();
+        return;
+    }
+    // Windows Time refused (it won't jump that far) or failed: over to the user.
+    d.userAction = true;
+    d.detail += L" — set the time under Settings > Time & language";
+    PublishDiagnosis(d);
+    Advise(d);
+}
+
+// ---------------------------------------------------------------- connectivity hints
+//
+// Windows' own connectivity verdict (NCSI), pushed on every change, so a drop
+// is noticed at once instead of at the next interval. Windows 10 2004+;
+// loaded dynamically — without it NetVigil just polls.
+
+struct NvConnectivityHint {   // mirrors NL_NETWORK_CONNECTIVITY_HINT
+    int level;                // 0 unknown, 1 none, 2 local, 3 internet, 4 constrained, 5 hidden
+    int cost;
+    BOOLEAN approachingDataLimit;
+    BOOLEAN overDataLimit;
+    BOOLEAN roaming;
+};
+enum : LONG { HintUnknown = 0, HintNone, HintLocal, HintInternet, HintConstrained, HintHidden };
+typedef VOID(CALLBACK* PfnHintCallback)(PVOID, NvConnectivityHint);
+typedef DWORD(WINAPI* PfnNotifyHint)(PfnHintCallback, PVOID, BOOLEAN, PHANDLE);
+typedef DWORD(WINAPI* PfnGetHint)(NvConnectivityHint*);
+
+static HANDLE g_hintHandle = nullptr;
+
+static VOID CALLBACK OnConnectivityHint(PVOID, NvConnectivityHint hint)
+{
+    LONG prev = InterlockedExchange(&g_hintLevel, (LONG)hint.level);
+    if (prev != (LONG)hint.level && g_hintEvent) SetEvent(g_hintEvent);
+}
+
+static const wchar_t* HintText(LONG level)
+{
+    switch (level) {
+    case HintNone:        return L"no connectivity";
+    case HintLocal:       return L"local network only";
+    case HintInternet:    return L"internet access";
+    case HintConstrained: return L"limited internet (sign-in page?)";
+    default:              return L"unknown connectivity";
+    }
+}
+
+static void StartConnectivityHints()
+{
+    HMODULE m = GetModuleHandleW(L"iphlpapi.dll");
+    auto notify = m ? (PfnNotifyHint)(void*)GetProcAddress(m, "NotifyNetworkConnectivityHintChange")
+                    : nullptr;
+    auto get = m ? (PfnGetHint)(void*)GetProcAddress(m, "GetNetworkConnectivityHint") : nullptr;
+    if (!notify) {
+        Logf(L"connectivity change notifications unavailable (Windows 10 2004+) — "
+             L"checking on the interval only");
+        return;
+    }
+    NvConnectivityHint h{};
+    if (get && get(&h) == NO_ERROR) InterlockedExchange(&g_hintLevel, (LONG)h.level);
+    DWORD rc = notify(OnConnectivityHint, nullptr, FALSE, &g_hintHandle);
+    if (rc != NO_ERROR) {
+        g_hintHandle = nullptr;
+        Logf(L"connectivity change notifications unavailable (%u)", rc);
+        return;
+    }
+    UpdateState([](MonitorState& s) { s.windowsLevel = (int)g_hintLevel; });
+}
+
+static void StopConnectivityHints()
+{
+    if (g_hintHandle) CancelMibChangeNotify2(g_hintHandle);
+    g_hintHandle = nullptr;
 }
 
 // ---------------------------------------------------------------- monitor loop
 
-// Wait until the next check: honours stop, "check now", a live interval
-// change from the GUI, and resume-from-sleep. Returns true if stop was
+// Wait until the next check: honours stop, "check now", resume from sleep, a
+// live interval change from the GUI, and Windows reporting that connectivity
+// changed in a way that contradicts `last`. Returns true if stop was
 // requested. `liveInterval` re-reads the configured interval each tick;
 // otherwise `minutes` is fixed (the short offline retry).
-static bool IntervalWait(DWORD minutes, bool liveInterval)
+static bool IntervalWait(DWORD minutes, bool liveInterval, Net last)
 {
+    static ULONGLONG lastHintCheck = 0;
     TrimWorkingSet();
     ULONGLONG start = GetTickCount64();
     ULONGLONG w0 = WallMs(), u0 = UnbiasedMs();
     ULONGLONG shown = 0;
-    HANDLE evs[2] = { g_stopEvent, g_wakeEvent };
-    DWORD nEvs = g_wakeEvent ? 2 : 1;
+    HANDLE evs[3];
+    DWORD nEvs = 0;
+    evs[nEvs++] = g_stopEvent;
+    if (g_wakeEvent) evs[nEvs++] = g_wakeEvent;
+    DWORD hintIdx = nEvs;
+    if (g_hintEvent) evs[nEvs++] = g_hintEvent;
     for (;;) {
         ULONGLONG total = (ULONGLONG)(liveInterval ? GetIntervalMin() : minutes) * 60000ull;
         ULONGLONG deadline = start + total;
@@ -1772,15 +3102,58 @@ static bool IntervalWait(DWORD minutes, bool liveInterval)
         DWORD r = g_stopEvent ? WaitForMultipleObjects(nEvs, evs, FALSE, chunk)
                               : (Sleep(chunk), WAIT_TIMEOUT);
         if (r == WAIT_OBJECT_0) return true;               // stop
-        if (r == WAIT_OBJECT_0 + 1) {                      // check now / pause toggle
-            Logf(L"check requested");
+        if (r == WAIT_OBJECT_0 + 1 && g_wakeEvent) {       // check now / pause / resume
+            Logf(InterlockedExchange(&g_resumed, 0) ? L"resume from sleep — checking connectivity now"
+                                                    : L"check requested");
             return false;
+        }
+        if (g_hintEvent && r == WAIT_OBJECT_0 + hintIdx) {
+            LONG lvl = g_hintLevel;
+            UpdateState([&](MonitorState& s) { s.windowsLevel = (int)lvl; });
+            bool worse  = last == Net::Online &&
+                          (lvl == HintNone || lvl == HintLocal || lvl == HintConstrained);
+            bool better = last != Net::Online && lvl == HintInternet;
+            if ((worse || better) && GetTickCount64() - lastHintCheck > 20000ull) {
+                lastHintCheck = GetTickCount64();
+                Logf(L"Windows reports %ls — checking now", HintText(lvl));
+                if (worse && WaitStop(5000)) return true;  // let a blip settle
+                return false;
+            }
+            continue;
         }
         ULONGLONG wallD = WallMs() - w0, unbD = UnbiasedMs() - u0;
         if (wallD > unbD + 90000ull) {
+            InterlockedExchange(&g_resumed, 0);
             Logf(L"resume from sleep detected — checking connectivity now");
             return false;
         }
+    }
+}
+
+// The confirmation delay before acting on a loss — cut short when Windows
+// reports internet access again. Returns true if stop was requested.
+static bool ConfirmWait(DWORD ms)
+{
+    ULONGLONG end = GetTickCount64() + ms;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= end) return false;
+        HANDLE evs[2];
+        DWORD n = 0;
+        if (g_stopEvent) evs[n++] = g_stopEvent;
+        DWORD hintIdx = n;
+        if (g_hintEvent) evs[n++] = g_hintEvent;
+        if (n == 0) {
+            Sleep((DWORD)(end - now));
+            return false;
+        }
+        DWORD r = WaitForMultipleObjects(n, evs, FALSE, (DWORD)(end - now));
+        if (g_stopEvent && r == WAIT_OBJECT_0) return true;
+        if (r == WAIT_OBJECT_0 + hintIdx && g_hintLevel == HintInternet) {
+            Logf(L"Windows reports internet access again — re-checking early");
+            return false;
+        }
+        if (r == WAIT_TIMEOUT || r == WAIT_FAILED) return false;
     }
 }
 
@@ -1802,31 +3175,56 @@ static void PublishCheck(Net n, int failStreak, ULONGLONG offlineSince)
     });
 }
 
+static bool IsRunningInstalledCopy(); // fwd (task mgmt)
+static std::wstring AutostartArgs();      // fwd
+
+// An elevated installed copy keeps its own startup task current: tasks made
+// by older versions (schtasks defaults) are killed after 72 h and never
+// start on battery. Tasks the user edited to the current format are left be.
+static void MaintainStartupTask()
+{
+    if (!g_elevated || !IsRunningInstalledCopy()) return;
+    StartupTaskInfo t;
+    std::wstring err;
+    if (!QueryStartupTask(t, &err) || !t.exists || !t.readable) return;
+    if (t.format >= nv::kTaskFormat) return;
+    if (_wcsicmp(t.command.c_str(), ExePath().c_str()) != 0) return;
+    if (RegisterStartupTask(ExePath(), AutostartArgs(), SessionUserSid(nullptr), &err))
+        Logf(L"startup task upgraded: no 3-day time limit, starts on battery, and relaunches "
+             L"NetVigil within %u min if it stops", kRelaunchMin);
+    else
+        Logf(L"startup task upgrade failed: %ls", err.c_str());
+}
+
 // The watchdog loop. Runs on its own thread under the GUI and exits when the
 // stop event is signalled.
 DWORD WINAPI MonitorThreadProc(LPVOID)
 {
     Logf(L"=== NetVigil started (interval %u min, %ls) ===", GetIntervalMin(),
          g_elevated ? L"elevated"
-                    : L"NOT elevated — stage-2 driver reset unavailable");
+                    : L"NOT elevated — adapter resets and service repairs unavailable");
     UpdateState([](MonitorState& s) {
         s.elevated = g_elevated;
         s.paused   = g_paused != 0;
     });
+    MaintainStartupTask();
+    StartConnectivityHints();
 
     bool firstCycle = true;
     int  failStreak = 0;
-    ULONGLONG lastReset = 0, lastOkLog = 0, offlineSince = 0;
+    ULONGLONG lastOkLog = 0, offlineSince = 0;
 
     for (;;) {
         if (StopRequested()) break;
         if (g_paused) {
             HANDLE evs[2] = { g_stopEvent, g_wakeEvent };
             if (WaitForMultipleObjects(2, evs, FALSE, INFINITE) == WAIT_OBJECT_0) break;
+            InterlockedExchange(&g_resumed, 0);
             continue;
         }
 
-        Net n = CheckInternet();
+        Connectivity c = Probe();
+        Net n = c.verdict;
         PublishCheck(n, failStreak, offlineSince);
 
         if (n == Net::Online || n == Net::Degraded) {
@@ -1837,17 +3235,25 @@ DWORD WINAPI MonitorThreadProc(LPVOID)
                 offlineSince = 0;
             }
             if (n == Net::Degraded) {
-                Logf(L"degraded: ICMP works but HTTP/DNS failing — "
-                     L"attempting lightweight repair");
-                DiagnoseDegraded(); // proxy diagnosis + DNS flush, rate-limited
-            } else if (GetTickCount64() - lastOkLog > 3600000ull) {
-                Logf(L"online");
-                lastOkLog = GetTickCount64();
+                Logf(L"degraded: the internet answers by IP but web requests fail — diagnosing");
+                if (RepairDegraded(c) == Net::Online) {
+                    n = Net::Online;
+                    PublishCheck(n, 0, 0);
+                    ClearDiagnosis();
+                }
+            } else if (c.clockKnown && llabs(c.clockSkew) >= nv::kClockSkewLimitSec) {
+                RepairClock(c);
+            } else {
+                if (GetMonitorState().fault) ClearDiagnosis();
+                if (GetTickCount64() - lastOkLog > 3600000ull) {
+                    Logf(L"online");
+                    lastOkLog = GetTickCount64();
+                }
             }
             failStreak = 0;
             firstCycle = false;
             UpdateState([](MonitorState& s) { s.failStreak = 0; s.offlineSince = 0; });
-            if (IntervalWait(0, true)) break;
+            if (IntervalWait(0, true, n)) break;
             continue;
         }
 
@@ -1861,55 +3267,61 @@ DWORD WINAPI MonitorThreadProc(LPVOID)
             s.remediating = true;
             s.lastAction  = L"confirming the loss";
         });
-        if (WaitStop(confirmMs)) break;
+        if (ConfirmWait(confirmMs)) break;
         firstCycle = false;
 
-        Net n2 = CheckInternet();
-        if (n2 == Net::Online || n2 == Net::Degraded) {
-            Logf(L"false alarm — back online");
+        Connectivity c2 = Probe();
+        if (c2.verdict == Net::Online || c2.verdict == Net::Degraded) {
+            if (failStreak > 0) {   // mid-outage: this is the recovery
+                ULONGLONG mins = offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0;
+                Logf(L"connectivity restored after %llu min offline", mins);
+                NotifyUi(UiRestored, (LPARAM)mins);
+                offlineSince = 0;
+            } else {
+                Logf(L"false alarm — back online");
+            }
             failStreak = 0;
-            PublishCheck(n2, 0, 0);
-            if (IntervalWait(0, true)) break;
+            ClearDiagnosis();
+            PublishCheck(c2.verdict, 0, 0);
+            if (IntervalWait(0, true, c2.verdict)) break;
             continue;
         }
 
         ++failStreak;
-        if (failStreak == 1) {
-            offlineSince = GetTickCount64();
-            LogNetSnapshot(); // adapter/IP/gateway/DNS state at the moment of loss
-        }
-        Logf(L"confirmed %ls (streak %d) — starting remediation",
-             NetToStr(n2), failStreak);
+        if (failStreak == 1) offlineSince = GetTickCount64();
+        Logf(L"confirmed %ls (streak %d) — diagnosing", NetToStr(c2.verdict), failStreak);
         UpdateState([&](MonitorState& s) {
-            s.status       = n2;
+            s.status       = c2.verdict;
             s.failStreak   = failStreak;
             s.offlineSince = offlineSince;
             s.remediating  = true;
-            s.lastAction   = L"repairing the connection";
+            s.lastAction   = L"diagnosing";
         });
-        Net after = Remediate(n2, lastReset);
+        Net after = RunRepairs(c2, failStreak, 3);
         PublishCheck(after, failStreak, offlineSince);
 
         if (after == Net::Online || after == Net::Degraded) {
             ULONGLONG mins = offlineSince ? (GetTickCount64() - offlineSince) / 60000ull : 0;
-            Logf(L"remediation succeeded — back online after %llu min", mins);
+            Logf(L"repaired — back online after %llu min", mins);
             NotifyUi(UiRestored, (LPARAM)mins);
             offlineSince = 0;
             failStreak = 0;
+            ClearDiagnosis();
             UpdateState([](MonitorState& s) {
                 s.failStreak = 0;
                 s.offlineSince = 0;
                 s.lastAction = L"repaired";
             });
-            if (IntervalWait(0, true)) break;
+            if (IntervalWait(0, true, after)) break;
         } else {
             Logf(L"still %ls — next attempt in %u min", NetToStr(after), kOfflineRetryMin);
             NotifyUi(UiFailed, (LPARAM)failStreak);
-            UpdateState([](MonitorState& s) { s.lastAction = L"repair failed — retrying"; });
-            if (IntervalWait(kOfflineRetryMin, false)) break;
+            UpdateState([](MonitorState& s) { s.lastAction = L"waiting to retry"; });
+            if (IntervalWait(kOfflineRetryMin, false, after)) break;
         }
     }
 
+    StopConnectivityHints();
     Logf(L"stop requested — NetVigil exiting");
     UpdateState([](MonitorState& s) { s.stopping = true; });
     NotifyUi(UiStopped);
@@ -1921,28 +3333,63 @@ static ScopedHandle g_instanceMutex; // held for the process lifetime
 static void EnableDpiAwareness()
 {
     typedef BOOL(WINAPI* PfnSetCtx)(DPI_AWARENESS_CONTEXT);
-    PfnSetCtx set = (PfnSetCtx)GetProcAddress(GetModuleHandleW(L"user32.dll"),
-                                              "SetProcessDpiAwarenessContext");
+    PfnSetCtx set = (PfnSetCtx)(void*)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                                     "SetProcessDpiAwarenessContext");
     if (!set || !set(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)) SetProcessDPIAware();
+}
+
+static void SignalRunningInstance();        // fwd (task mgmt)
+static bool WaitInstanceExit(DWORD ms);     // fwd
+
+// The startup task runs elevated; if the user started a normal copy first,
+// the elevated one replaces it — otherwise adapter resets would be off.
+static bool TakeOverFromNonElevated()
+{
+    HWND w = FindWindowW(kWndClass, nullptr);
+    DWORD pid = 0;
+    if (!w || !GetWindowThreadProcessId(w, &pid) || !pid) return false;
+    ScopedHandle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!proc.valid()) return false;
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(proc.h, TOKEN_QUERY, &tok)) return false;
+    ScopedHandle tokGuard(tok);
+    if (TokenIsElevated(tok)) return false;
+    Logf(L"NetVigil is running without admin rights — replacing it with this elevated instance");
+    SignalRunningInstance();
+    return WaitInstanceExit(30000);
 }
 
 // Monitor mode: claim the single instance (or hand off to the running one),
 // create the control events, load config and run the tray/window front end
-// with the watchdog on a worker thread.
-static int StartMonitorGui(HINSTANCE hInst, bool startHidden, DWORD intervalArg)
+// with the watchdog on a worker thread. `autostart` = launched by the
+// startup task (at sign-in, or its relaunch trigger).
+static int StartMonitorGui(HINSTANCE hInst, bool startHidden, bool autostart, DWORD intervalArg)
 {
+    // "Exit" in the tray means exit until the next sign-in.
+    if (autostart && UserExitedThisSession()) return 0;
+
     SECURITY_ATTRIBUTES* sa = NamedObjSa();
     g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
     DWORD mutexErr = GetLastError();
     bool running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
+    if (running && autostart && g_elevated) {
+        g_instanceMutex.reset();
+        if (TakeOverFromNonElevated()) {
+            g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
+            mutexErr = GetLastError();
+            running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
+        }
+    }
     if (running) {
         // NULL + ACCESS_DENIED means the mutex exists but was created by a
         // differently-privileged instance — that still counts as running.
-        if (!g_instanceMutex.valid() && mutexErr != ERROR_ACCESS_DENIED) {
+        if (!g_instanceMutex.valid() && mutexErr != ERROR_ACCESS_DENIED &&
+            mutexErr != ERROR_ALREADY_EXISTS) {
             Logf(L"single-instance mutex unavailable (%u) — exiting", mutexErr);
             return 1;
         }
         g_instanceMutex.reset();
+        if (autostart) return 0;   // relaunch trigger while running: nothing to do
         HWND existing = startHidden ? nullptr : FindWindowW(kWndClass, nullptr);
         if (existing && PostMessageW(existing, ShowWindowMessage(), 0, 0)) {
             Logf(L"NetVigil is already running — opened its window");
@@ -1951,6 +3398,7 @@ static int StartMonitorGui(HINSTANCE hInst, bool startHidden, DWORD intervalArg)
         Logf(L"another NetVigil instance is already running — exiting");
         return 1;
     }
+    if (!autostart) ClearUserExit(); // started by hand: automatic relaunch applies again
 
     g_stopEvent = CreateEventW(sa, TRUE, FALSE, kStopEventName);
     DWORD evErr = GetLastError();
@@ -1961,6 +3409,7 @@ static int StartMonitorGui(HINSTANCE hInst, bool startHidden, DWORD intervalArg)
         ResetEvent(g_stopEvent); // clear a stale signal from a previous run
 
     LoadConfig(intervalArg);
+    if (autostart) Logf(L"started by the startup task");
     EnableDpiAwareness();
     int rc = RunGui(hInst, startHidden);
 
@@ -1991,8 +3440,8 @@ static DWORD RunProcess(const std::wstring& cmdLine, bool quiet)
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> buf(cmdLine.begin(), cmdLine.end());
     buf.push_back(L'\0');
-    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, 0,
-                        nullptr, nullptr, &si, &pi)) {
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE,
+                        quiet ? CREATE_NO_WINDOW : 0, nullptr, nullptr, &si, &pi)) {
         Logf(L"CreateProcess failed (%u): %ls", GetLastError(), cmdLine.c_str());
         return (DWORD)-1;
     }
@@ -2002,12 +3451,6 @@ static DWORD RunProcess(const std::wstring& cmdLine, bool quiet)
     DWORD code = (DWORD)-1;
     GetExitCodeProcess(proc.h, &code);
     return code;
-}
-
-static bool TaskInstalled()
-{
-    std::wstring cmd = L"\"" + Sys32(L"schtasks.exe") + L"\" /Query /TN " + kTaskName;
-    return RunProcess(cmd, true) == 0;
 }
 
 static void SignalRunningInstance()
@@ -2020,19 +3463,34 @@ static void SignalRunningInstance()
     }
 }
 
+static bool InstanceRunning()
+{
+    HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, kMutexName);
+    if (m) {
+        CloseHandle(m);
+        return true;
+    }
+    return GetLastError() != ERROR_FILE_NOT_FOUND;
+}
+
 // Wait until no instance holds the single-instance mutex any more.
 static bool WaitInstanceExit(DWORD ms)
 {
     ULONGLONG end = GetTickCount64() + ms;
     for (;;) {
-        HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, kMutexName);
-        if (!m) {
-            if (GetLastError() == ERROR_FILE_NOT_FOUND) return true;
-        } else {
-            CloseHandle(m);
-        }
+        if (!InstanceRunning()) return true;
         if (GetTickCount64() >= end) return false;
         Sleep(1000);
+    }
+}
+
+static bool WaitInstanceStart(DWORD ms)
+{
+    ULONGLONG end = GetTickCount64() + ms;
+    for (;;) {
+        if (InstanceRunning()) return true;
+        if (GetTickCount64() >= end) return false;
+        Sleep(500);
     }
 }
 
@@ -2044,6 +3502,13 @@ static std::wstring InstallDirPath()
     DWORD n = GetEnvironmentVariableW(L"ProgramFiles", buf, MAX_PATH);
     std::wstring pf = (n > 0 && n < MAX_PATH) ? buf : L"C:\\Program Files";
     return pf + L"\\NetVigil";
+}
+
+static std::wstring InstalledExe() { return InstallDirPath() + L"\\NetVigil.exe"; }
+
+static std::wstring AutostartArgs()
+{
+    return L"--autostart --interval " + std::to_wstring(GetIntervalMin());
 }
 
 // Fire-and-forget launch of ourselves (or a helper copy), elevated if asked.
@@ -2063,12 +3528,35 @@ static bool LaunchDetached(const std::wstring& exe, const std::wstring& args, bo
     return true;
 }
 
-bool IsInstalledAtStartup() { return TaskInstalled(); }
-
-bool IsRunningInstalledCopy()
+// This exe IS %ProgramFiles%\NetVigil\NetVigil.exe.
+static bool IsRunningInstalledCopy()
 {
-    std::wstring destExe = InstallDirPath() + L"\\NetVigil.exe";
-    return _wcsicmp(ExePath().c_str(), destExe.c_str()) == 0;
+    return _wcsicmp(ExePath().c_str(), InstalledExe().c_str()) == 0;
+}
+
+StartupStatus GetStartupStatus()
+{
+    StartupStatus st;
+    StartupTaskInfo t;
+    if (!QueryStartupTask(t, &st.detail)) return st;       // Unknown
+    if (!t.exists) {
+        st.state = StartupState::NotInstalled;
+    } else if (!t.readable) {
+        st.state = StartupState::Installed;                // cannot inspect: trust it
+    } else if (!t.enabled) {
+        st.state = StartupState::Disabled;
+    } else if (!t.command.empty() &&
+               GetFileAttributesW(t.command.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        st.state = StartupState::Broken;
+        st.detail = t.command;
+    } else if (t.format < nv::kTaskFormat) {
+        st.state = StartupState::Outdated;
+    } else if (!t.command.empty() && _wcsicmp(ExePath().c_str(), t.command.c_str()) != 0) {
+        st.state = StartupState::OtherCopy;
+    } else {
+        st.state = StartupState::Installed;
+    }
+    return st;
 }
 
 // Both launchers stop THIS instance as part of their job (SignalRunningInstance
@@ -2086,8 +3574,7 @@ bool LaunchUninstaller()
 {
     std::wstring helper = ExePath();
     std::wstring args = L"--uninstall";
-    std::wstring destExe = InstallDirPath() + L"\\NetVigil.exe";
-    if (_wcsicmp(helper.c_str(), destExe.c_str()) == 0) {
+    if (IsRunningInstalledCopy()) {
         // We ARE the installed copy: a helper copy in %TEMP% does the removal
         // and deletes itself at the next reboot.
         wchar_t tmp[MAX_PATH] = {};
@@ -2132,6 +3619,94 @@ static bool RelaunchElevated(const wchar_t* args)
     return code == 0;
 }
 
+// Copy via a temporary file and an atomic rename, so an interrupted update
+// never leaves a half-written exe for the elevated task to run.
+static bool InstallCopy(const std::wstring& dest)
+{
+    std::wstring tmp = dest + L".new";
+    if (!CopyFileW(ExePath().c_str(), tmp.c_str(), FALSE)) return false;
+    for (int i = 0; i < 3; ++i) {
+        if (MoveFileExW(tmp.c_str(), dest.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return true;
+        Sleep(2000); // previous instance may still be releasing the file
+    }
+    DWORD err = GetLastError();
+    DeleteFileW(tmp.c_str());
+    SetLastError(err);
+    return false;
+}
+
+// An --uninstall run from the installed copy scheduled it (and its folder)
+// for deletion at the next boot. A reinstall before that reboot must cancel
+// it, or the fresh copy vanishes at boot and the startup task breaks.
+static void CancelPendingDeletes(const std::vector<std::wstring>& paths)
+{
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+                      0, KEY_QUERY_VALUE | KEY_SET_VALUE, &k) != ERROR_SUCCESS)
+        return;
+    ScopedRegKey guard(k);
+    const wchar_t* value = L"PendingFileRenameOperations";
+    DWORD type = 0, bytes = 0;
+    if (RegQueryValueExW(k, value, nullptr, &type, nullptr, &bytes) != ERROR_SUCCESS ||
+        type != REG_MULTI_SZ || bytes < sizeof(wchar_t))
+        return;
+    std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 2, L'\0');
+    if (RegQueryValueExW(k, value, nullptr, &type, (BYTE*)buf.data(), &bytes) != ERROR_SUCCESS)
+        return;
+    // (source, target) pairs; an empty target means "delete". Empty strings
+    // are data here, so split by the byte count rather than at a double null.
+    size_t n = bytes / sizeof(wchar_t);
+    std::vector<std::wstring> items;
+    for (size_t i = 0; i < n;) {
+        size_t j = i;
+        while (j < n && buf[j]) ++j;
+        items.emplace_back(buf.data() + i, j - i);
+        i = j + 1;
+    }
+    if (items.size() % 2 == 1 && items.back().empty()) items.pop_back(); // list terminator
+    if (items.size() % 2 != 0) return;   // not the expected layout: leave it alone
+    std::vector<std::wstring> kept;
+    for (size_t i = 0; i < items.size(); i += 2) {
+        bool ours = false;
+        for (const auto& p : paths)
+            ours = ours || (items[i + 1].empty() &&
+                            _wcsicmp(items[i].c_str(), (L"\\?\?\\" + p).c_str()) == 0);
+        if (!ours) {
+            kept.push_back(items[i]);
+            kept.push_back(items[i + 1]);
+        }
+    }
+    if (kept.size() == items.size()) return;
+    if (kept.empty()) {
+        RegDeleteValueW(k, value);
+    } else {
+        std::wstring blob;
+        for (const auto& item : kept) {
+            blob += item;
+            blob.push_back(L'\0');
+        }
+        blob.push_back(L'\0');
+        RegSetValueExW(k, value, 0, REG_MULTI_SZ, (const BYTE*)blob.data(),
+                       (DWORD)(blob.size() * sizeof(wchar_t)));
+    }
+    Logf(L"cancelled the pending post-uninstall deletion of the installed copy");
+}
+
+// schtasks fallback for when the Task Scheduler API refuses the definition.
+static bool LegacyCreateTask(const std::wstring& exe, DWORD intervalMin)
+{
+    std::wstring tr = L"\\\"" + exe + L"\\\" --autostart --interval " +
+                      std::to_wstring(intervalMin);
+    std::wstring cmd = L"\"" + Sys32(L"schtasks.exe") +
+                       L"\" /Create /F /TN " + kTaskName +
+                       L" /SC ONLOGON /DELAY 0000:30 /RL HIGHEST /TR \"" + tr + L"\"";
+    DWORD rc = RunProcess(cmd, false);
+    if (rc != 0) Logf(L"schtasks /Create failed (exit %u)", rc);
+    return rc == 0;
+}
+
 static int CmdInstall(DWORD intervalMin)
 {
     if (!g_elevated) {
@@ -2156,15 +3731,11 @@ static int CmdInstall(DWORD intervalMin)
              L"'schtasks /Run /TN NetVigil' if the monitor is not running");
 
     std::wstring destDir = InstallDirPath();
-    std::wstring destExe = destDir + L"\\NetVigil.exe";
-    if (_wcsicmp(ExePath().c_str(), destExe.c_str()) != 0) {
+    std::wstring destExe = InstalledExe();
+    CancelPendingDeletes({ destExe, destDir });
+    if (!IsRunningInstalledCopy()) {
         CreateDirectoryW(destDir.c_str(), nullptr);
-        BOOL copied = CopyFileW(ExePath().c_str(), destExe.c_str(), FALSE);
-        if (!copied) {
-            Sleep(2000); // previous instance may still be releasing the file
-            copied = CopyFileW(ExePath().c_str(), destExe.c_str(), FALSE);
-        }
-        if (!copied) {
+        if (!InstallCopy(destExe)) {
             Logf(L"failed to copy exe to %ls (%u) — aborting install",
                  destExe.c_str(), GetLastError());
             return 1;
@@ -2173,25 +3744,38 @@ static int CmdInstall(DWORD intervalMin)
              L"cannot be pointed at a user-writable binary)", destExe.c_str());
     }
 
-    std::wstring tr = L"\\\"" + destExe + L"\\\" --tray --interval " +
-                      std::to_wstring(intervalMin);
-    std::wstring cmd = L"\"" + Sys32(L"schtasks.exe") +
-                       L"\" /Create /F /TN " + kTaskName +
-                       L" /SC ONLOGON /DELAY 0000:30 /RL HIGHEST /TR \"" + tr + L"\"";
-    DWORD rc = RunProcess(cmd, false);
-    if (rc != 0) {
-        Logf(L"schtasks /Create failed (exit %u)", rc);
-        return 1;
-    }
-    Logf(L"startup task '%ls' installed (runs at logon, elevated, interval %u min)",
-         kTaskName, intervalMin);
-    EnsureUnicodeIni();
-    SaveSetting(L"interval", std::to_wstring(intervalMin));
+    // The task belongs to whoever is signed in here — not to the admin whose
+    // password approved the UAC prompt on a standard account.
+    std::wstring account;
+    std::wstring user = SessionUserSid(&account);
+    std::wstring self = ProcessUserSid();
+    if (!user.empty() && !self.empty() && _wcsicmp(user.c_str(), self.c_str()) != 0)
+        Logf(L"installing for %ls, the account signed in on this desktop (not the "
+             L"administrator who approved the prompt)", account.c_str());
 
-    // Start it now so no re-logon is needed.
-    std::wstring runCmd = L"\"" + Sys32(L"schtasks.exe") + L"\" /Run /TN " + kTaskName;
-    if (RunProcess(runCmd, false) == 0)
+    InterlockedExchange(&g_intervalMin, (LONG)intervalMin);
+    std::wstring err;
+    bool ok = RegisterStartupTask(destExe, AutostartArgs(), user, &err);
+    if (!ok) {
+        Logf(L"%ls — falling back to schtasks", err.c_str());
+        ok = LegacyCreateTask(destExe, intervalMin);
+    }
+    if (!ok) return 1;
+    Logf(L"startup task '%ls' installed: NetVigil starts at sign-in (elevated, also on "
+         L"battery) and is relaunched within %u min if it ever stops", kTaskName, kRelaunchMin);
+    SaveSetting(L"interval", std::to_wstring(intervalMin));
+    ClearUserExit();
+
+    // Start it now so no re-logon is needed — and make sure it really runs.
+    if (!RunStartupTask(&err)) {
+        Logf(L"%ls — trying schtasks /Run", err.c_str());
+        RunProcess(L"\"" + Sys32(L"schtasks.exe") + L"\" /Run /TN " + kTaskName, false);
+    }
+    if (WaitInstanceStart(15000))
         Logf(L"monitor started (log: %ls)", g_logPath.c_str());
+    else
+        Logf(L"warning: the startup task has not started NetVigil yet — check task '%ls' in "
+             L"Task Scheduler; it will also start at the next sign-in", kTaskName);
     return 0;
 }
 
@@ -2210,9 +3794,14 @@ static int CmdUninstall()
     SignalRunningInstance();
     WaitInstanceExit(60000); // a mid-repair instance can take a while to unwind
     DWORD rc = 0;
-    if (!TaskInstalled()) {
+    StartupTaskInfo t;
+    std::wstring err;
+    if (QueryStartupTask(t, &err) && !t.exists) {
         Logf(L"startup task was not installed — nothing to remove");
+    } else if (DeleteStartupTask(&err)) {
+        Logf(L"startup task removed");
     } else {
+        Logf(L"%ls — trying schtasks /Delete", err.c_str());
         std::wstring cmd = L"\"" + Sys32(L"schtasks.exe") + L"\" /Delete /F /TN " + kTaskName;
         rc = RunProcess(cmd, false);
         Logf(rc == 0 ? L"startup task removed" : L"schtasks /Delete failed (exit %u)", rc);
@@ -2221,9 +3810,9 @@ static int CmdUninstall()
     // Remove the installed copy (never the exe the user launched from
     // elsewhere). If we ARE that copy, it cannot delete itself — defer.
     std::wstring destDir = InstallDirPath();
-    std::wstring destExe = destDir + L"\\NetVigil.exe";
+    std::wstring destExe = InstalledExe();
     if (GetFileAttributesW(destExe.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        if (_wcsicmp(ExePath().c_str(), destExe.c_str()) == 0) {
+        if (IsRunningInstalledCopy()) {
             MoveFileExW(destExe.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
             MoveFileExW(destDir.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
             Logf(L"installed copy removes itself at next reboot");
@@ -2252,6 +3841,7 @@ static int CmdStop()
         Logf(L"no running NetVigil instance found in this session");
         return 1;
     }
+    MarkUserExit(); // the startup task's relaunch trigger must not undo this
     SetEvent(ev);
     CloseHandle(ev);
     Logf(L"stop signal sent");
@@ -2262,13 +3852,27 @@ static int CmdStop()
 
 static int CmdStatus()
 {
+    LoadConfig(kDefaultIntervalMin);
     Logf(L"NetVigil status");
     Logf(L"  exe:       %ls", ExePath().c_str());
     Logf(L"  elevated:  %ls", g_elevated ? L"yes" : L"no");
     Logf(L"  log:       %ls", g_logPath.c_str());
-    Logf(L"  task:      %ls", TaskInstalled() ? L"installed" : L"not installed");
+    StartupTaskInfo t;
+    std::wstring err;
+    if (!QueryStartupTask(t, &err))
+        Logf(L"  startup:   unknown (%ls)", err.c_str());
+    else if (!t.exists)
+        Logf(L"  startup:   not installed");
+    else if (!t.readable)
+        Logf(L"  startup:   installed");
+    else
+        Logf(L"  startup:   installed%ls, task format %d%ls — %ls %ls",
+             t.enabled ? L"" : L" but DISABLED in Task Scheduler", t.format,
+             t.format < nv::kTaskFormat ? L" (outdated: --install upgrades it)" : L"",
+             t.command.empty() ? L"(command not readable)" : t.command.c_str(),
+             t.arguments.c_str());
 
-    ScopedWlan wl(OpenWlan());
+    ScopedWlan wl(OpenWlan(true));
     if (!wl.h) {
         Logf(L"  WLAN:      unavailable (WlanSvc not running?)");
     } else {
@@ -2283,7 +3887,6 @@ static int CmdStatus()
                  IfStateStr(st), extra.c_str());
         }
     }
-    LogNetSnapshot();
 
     ProbeResult a = HttpProbe(L"www.msftconnecttest.com", L"/connecttest.txt",
                               false, "Microsoft Connect Test");
@@ -2294,44 +3897,73 @@ static int CmdStatus()
          ? L"unexpected response (portal?)" : L"no response");
     Logf(L"  probe ping 1.1.1.1:    %ls", PingProbe("1.1.1.1") ? L"ok" : L"failed");
     Logf(L"  probe ping 8.8.8.8:    %ls", PingProbe("8.8.8.8") ? L"ok" : L"failed");
-    Logf(L"  verdict:   %ls", NetToStr(CheckInternet()));
+    Logf(L"  probe tcp 1.1.1.1:443: %ls",
+         TcpProbe(Ipv4("1.1.1.1"), 443, 3000) ? L"ok" : L"failed");
+    if (a.ok || b.ok) {
+        const ProbeResult& good = a.ok ? a : b;
+        if (good.dateKnown)
+            Logf(L"  clock:     %ls", llabs(good.skewSec) < 60
+                 ? L"in step with internet time"
+                 : (L"off by " + nv::DurationText(good.skewSec) +
+                    (good.skewSec > 0 ? L" (ahead)" : L" (behind)")).c_str());
+    }
+
+    Connectivity c = Probe();
+    nv::Observation o = Observe(c, 0, true);
+    LogObservation(o);
+    Logf(L"  verdict:   %ls", NetToStr(c.verdict));
+    nv::Diagnosis d = nv::Diagnose(o);
+    LogDiagnosis(d, o);
+    if (!d.plan.empty()) Logf(L"  (--status only looks; --once would run this plan)");
+    std::wstring stats = RepairStats();
+    if (!stats.empty()) Logf(L"  repairs that worked here: %ls", stats.c_str());
     return 0;
 }
 
 static int CmdOnce()
 {
-    Net n = CheckInternet();
-    Logf(L"connectivity: %ls", NetToStr(n));
-    if (n == Net::Degraded) {
-        n = DiagnoseDegraded();
-        Logf(L"after lightweight repair: %ls", NetToStr(n));
+    LoadConfig(kDefaultIntervalMin);
+    Connectivity c = Probe();
+    Logf(L"connectivity: %ls", NetToStr(c.verdict));
+    if (c.verdict == Net::Online) {
+        if (c.clockKnown && llabs(c.clockSkew) >= nv::kClockSkewLimitSec) RepairClock(c);
+        return 0;
     }
-    if (n == Net::Online || n == Net::Degraded) return 0;
-    LogNetSnapshot();
-    ULONGLONG dummy = 0;
-    Net after = Remediate(n, dummy);
-    Logf(L"final state: %ls", NetToStr(after));
-    return after == Net::Online || after == Net::Degraded ? 0 : 1;
+    Net n = c.verdict;
+    if (n == Net::Degraded) {
+        n = RunRepairs(c, 0, 1);
+        Logf(L"after the repair above IP: %ls", NetToStr(n));
+        if (n == Net::Online || n == Net::Degraded) return 0;
+        c = Probe();
+    }
+    n = RunRepairs(c, 1, 3);
+    Logf(L"final state: %ls", NetToStr(n));
+    return n == Net::Online || n == Net::Degraded ? 0 : 1;
 }
 
 static void PrintHelp()
 {
     fputs(
-        "NetVigil - Wi-Fi connectivity watchdog\n"
+        "NetVigil - connectivity watchdog\n"
         "\n"
         "  NetVigil.exe                 open the window (starts the watchdog if needed)\n"
-        "  NetVigil.exe --tray          start hidden in the tray (what the logon task runs)\n"
+        "  NetVigil.exe --tray          start hidden in the tray\n"
+        "  NetVigil.exe --autostart     what the startup task runs: like --tray, but quiet\n"
+        "                               if already running, and honours a tray Exit until\n"
+        "                               the next sign-in\n"
         "  NetVigil.exe --interval N    check every N minutes (persisted in netvigil.ini)\n"
-        "  NetVigil.exe --install       register + start the logon task (elevates)\n"
+        "  NetVigil.exe --install       register + start the startup task (elevates)\n"
         "  NetVigil.exe --uninstall     stop the monitor and remove the task\n"
         "  NetVigil.exe --stop          signal a running monitor to exit\n"
-        "  NetVigil.exe --status        show adapters, probes, task and verdict\n"
-        "  NetVigil.exe --once          one check; remediate if offline; exit\n"
+        "  NetVigil.exe --status        adapters, probes, startup task, and a diagnosis\n"
+        "                               with its repair plan (changes nothing)\n"
+        "  NetVigil.exe --once          one check; diagnose and repair if needed; exit\n"
         "\n"
         "Closing the window keeps NetVigil running in the tray; exit from the tray\n"
-        "menu. Escalation on confirmed loss: DHCP repair -> rejoin Wi-Fi -> reset the\n"
-        "adapter driver -> restart WlanSvc. Driver reset needs the elevated task (or\n"
-        "an elevated shell) and is rate-limited to once per 15 min.\n",
+        "menu. On a confirmed loss NetVigil first diagnoses the cause (ISP outage,\n"
+        "router, IP config, DNS, proxy, VPN, Wi-Fi radio/association/password, adapter\n"
+        "driver, services) and runs only the repairs that fit, cheapest first. Driver\n"
+        "resets and service repairs need the elevated task (or an elevated shell).\n",
         stdout);
     fflush(stdout);
 }
@@ -2350,7 +3982,8 @@ static BOOL WINAPI CtrlHandler(DWORD)
 }
 
 // Last-gasp logging so a crash of the long-running monitor is visible in the
-// log instead of the process just vanishing.
+// log instead of the process just vanishing. The startup task's relaunch
+// trigger brings the watchdog back.
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
     Logf(L"FATAL: unhandled exception 0x%08X at %p — exiting",
@@ -2358,8 +3991,6 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
          ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
     return EXCEPTION_EXECUTE_HANDLER;
 }
-
-static bool g_wsaOk = false;
 
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
@@ -2373,8 +4004,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     int wsaRc = WSAStartup(MAKEWORD(2, 2), &wsa);
     g_wsaOk = (wsaRc == 0);
     if (!g_wsaOk)
-        Logf(L"WSAStartup failed (%d) — continuing; probes are unaffected", wsaRc);
-    g_queryUnbiased = (PfnQueryUnbiased)GetProcAddress(
+        Logf(L"WSAStartup failed (%d) — continuing without the TCP and DNS probes", wsaRc);
+    g_queryUnbiased = (PfnQueryUnbiased)(void*)GetProcAddress(
         GetModuleHandleW(L"kernel32.dll"), "QueryUnbiasedInterruptTime");
     g_elevated = IsElevated();
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
@@ -2384,12 +4015,13 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     enum class Mode { Monitor, Once, Status, Install, Uninstall, Stop, Help };
     Mode mode = Mode::Monitor;
-    bool tray = false;
+    bool tray = false, autostart = false;
     DWORD interval = kDefaultIntervalMin;
 
     for (int i = 1; argv && i < argc; ++i) {
         std::wstring a = Lower(argv[i]);
         if      (a == L"--tray")      tray = true;
+        else if (a == L"--autostart") tray = autostart = true;
         else if (a == L"--helper")    g_helper = true;
         else if (a == L"--once")      mode = Mode::Once;
         else if (a == L"--status")    mode = Mode::Status;
@@ -2419,7 +4051,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     case Mode::Uninstall: rc = CmdUninstall();       break;
     case Mode::Stop:      rc = CmdStop();            break;
     case Mode::Help:      PrintHelp();               break;
-    default:              rc = StartMonitorGui(hInst, tray, interval); break;
+    default:              rc = StartMonitorGui(hInst, tray, autostart, interval); break;
     }
 
     if (g_wsaOk) WSACleanup();
