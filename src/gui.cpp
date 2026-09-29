@@ -44,7 +44,9 @@ enum : int {
     ID_BTN_CONNECT, ID_BTN_CHECK, ID_BTN_PAUSE, ID_LBL_LOG, ID_LOG,
     // Settings page
     ID_LBL_INT, ID_EDIT_INTERVAL, ID_LBL_MIN, ID_BTN_APPLY, ID_CHK_NOTIFY, ID_CHK_FAILOVER,
-    ID_LBL_STARTUP, ID_STARTUP_STATE, ID_BTN_INSTALL, ID_LBL_FILES, ID_FILES_PATH,
+    ID_LBL_STARTUP, ID_STARTUP_STATE, ID_BTN_INSTALL,
+    ID_LBL_UPDATES, ID_UPDATE_STATE, ID_BTN_CHECKUPD, ID_BTN_INSTALLUPD, ID_CHK_AUTOUPD,
+    ID_LBL_FILES, ID_FILES_PATH,
     ID_BTN_LOGDIR, ID_LBL_UNINST, ID_UNINST_INFO, ID_BTN_UNINSTALL, ID_ABOUT,
     // tray menu
     TC_OPEN = 200, TC_PORTAL, TC_CHECK, TC_PAUSE, TC_EXIT,
@@ -57,7 +59,10 @@ struct Gui {
     HINSTANCE hInst = nullptr;
     HWND hwnd = nullptr, tabs = nullptr, status = nullptr, detail = nullptr, diag = nullptr,
          list = nullptr, log = nullptr, interval = nullptr, chkNotify = nullptr,
-         chkFailover = nullptr, btnPause = nullptr, startupState = nullptr, btnInstall = nullptr;
+         chkFailover = nullptr, btnPause = nullptr, startupState = nullptr, btnInstall = nullptr,
+         updateState = nullptr, btnCheckUpd = nullptr, btnInstallUpd = nullptr,
+         chkAutoUpd = nullptr;
+    std::wstring announcedUpdate;     // version the user was last told about
     std::vector<HWND> pages[2];
     int page = PageStatus;
     HFONT font = nullptr, fontBold = nullptr, fontBig = nullptr, fontMono = nullptr;
@@ -365,6 +370,60 @@ void SyncSettings()
     SetTextIfChanged(g.interval, std::to_wstring(GetIntervalMin()));
     CheckDlgButton(g.hwnd, ID_CHK_NOTIFY, GetNotifications() ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g.hwnd, ID_CHK_FAILOVER, GetFailover() ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(g.hwnd, ID_CHK_AUTOUPD, GetAutoUpdate() ? BST_CHECKED : BST_UNCHECKED);
+}
+
+std::wstring ClockText(long long unixSeconds)
+{
+    time_t t = (time_t)unixSeconds;
+    tm local{};
+    localtime_s(&local, &t);
+    wchar_t buf[32];
+    wcsftime(buf, 32, L"%H:%M", &local);
+    return buf;
+}
+
+// The Updates section of the Settings page.
+void SyncUpdateState()
+{
+    UpdaterState u = GetUpdateState();
+    const std::wstring ver = std::wstring(L"NetVigil ") + AppVersion();
+    std::wstring text;
+    const wchar_t* button = L"Install update…";
+    bool enableInstall = false;
+    switch (u.phase) {
+    case UpdaterState::Checking:
+        text = ver + L" — checking for updates…";
+        break;
+    case UpdaterState::UpToDate:
+        text = ver + L" — you have the latest version (checked " + ClockText(u.checkedAt) + L").";
+        break;
+    case UpdaterState::Available:
+        text = ver + L" — version " + u.latest + L" is available.";
+        if (u.canInstallHere) {
+            text += u.willAutoInstall ? L" It installs automatically." : L" Install it now to restart on the new version.";
+            enableInstall = true;
+        } else {
+            text += L" This copy is not installed at startup, so it cannot update itself.";
+            button = L"Download update…";
+            enableInstall = true;
+        }
+        break;
+    case UpdaterState::Applying:
+        text = ver + L" — installing version " + u.latest + L"; NetVigil will restart in the tray…";
+        break;
+    case UpdaterState::Failed:
+        text = ver + L" — the last update attempt failed: " + u.detail;
+        break;
+    default:
+        text = ver + L" — updates are checked automatically once a day.";
+        break;
+    }
+    SetTextIfChanged(g.updateState, text);
+    SetTextIfChanged(g.btnInstallUpd, button);
+    EnableWindow(g.btnInstallUpd, enableInstall);
+    EnableWindow(g.btnCheckUpd, u.phase != UpdaterState::Checking && u.phase != UpdaterState::Applying);
+    EnableWindow(g.chkAutoUpd, u.canInstallHere);
 }
 
 // Asks Task Scheduler, so only called when the Settings page is shown.
@@ -498,6 +557,7 @@ void ShowPage(int page)
     if (page == PageSettings) {
         SyncSettings();
         SyncStartupState();
+        SyncUpdateState();
     } else {
         RefreshNetworks();
         AppendNewLog();
@@ -547,7 +607,7 @@ HWND Add(int page, HWND h)
 
 void BuildControls()
 {
-    g.tabs = Mk(WC_TABCONTROLW, L"", WS_TABSTOP, 8, 8, 584, 464, ID_TABS);
+    g.tabs = Mk(WC_TABCONTROLW, L"", WS_TABSTOP, 8, 8, 584, 544, ID_TABS);
     TCITEMW ti{};
     ti.mask = TCIF_TEXT;
     ti.pszText = const_cast<LPWSTR>(L"Status");
@@ -631,6 +691,18 @@ void BuildControls()
     g.btnInstall = Add(PageSettings, Mk(L"BUTTON", L"Install at startup…", btn,
                                         ox, y + 60, 150, 26, ID_BTN_INSTALL));
     y += 104;
+    Add(PageSettings, Mk(L"STATIC", L"Updates", SS_LEFT, ox, y, pw, 18,
+                         ID_LBL_UPDATES, 0, g.fontBold));
+    g.updateState = Add(PageSettings, Mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX,
+                                         ox, y + 22, pw, 34, ID_UPDATE_STATE));
+    g.btnCheckUpd = Add(PageSettings, Mk(L"BUTTON", L"Check for updates", btn,
+                                         ox, y + 60, 132, 26, ID_BTN_CHECKUPD));
+    g.btnInstallUpd = Add(PageSettings, Mk(L"BUTTON", L"Install update…", btn,
+                                           ox + 138, y + 60, 132, 26, ID_BTN_INSTALLUPD));
+    g.chkAutoUpd = Add(PageSettings, Mk(L"BUTTON", L"Install updates automatically",
+                                        BS_AUTOCHECKBOX | WS_TABSTOP, ox + 284, y + 62,
+                                        pw - 284, 22, ID_CHK_AUTOUPD));
+    y += 96;
     Add(PageSettings, Mk(L"STATIC", L"Settings and log", SS_LEFT, ox, y, pw, 18,
                          ID_LBL_FILES, 0, g.fontBold));
     Add(PageSettings, Mk(L"STATIC", DataDir().c_str(),
@@ -648,8 +720,9 @@ void BuildControls()
     Add(PageSettings, Mk(L"BUTTON", L"Uninstall NetVigil…", btn, ox, y + 60, 150, 26,
                          ID_BTN_UNINSTALL));
     Add(PageSettings, Mk(L"STATIC",
-                         L"NetVigil · plain Win32, no dependencies · closing the window keeps it "
-                         L"running in the tray",
+                         (std::wstring(L"NetVigil ") + AppVersion() +
+                          L" · plain Win32, no dependencies · closing the window keeps it "
+                          L"running in the tray").c_str(),
                          SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
                          ox, oy + ph - 18, pw, 18, ID_ABOUT));
 
@@ -697,6 +770,24 @@ void OnCoreEvent(UiEvent ev, LPARAM lp)
         else if (!st.diagnosisDetail.empty())
             Balloon(nv::FaultName((nv::Fault)lp), Sentence(st.diagnosisDetail), false,
                     NIIF_WARNING);
+        break;
+    }
+    case UiUpdate: {
+        UpdaterState u = GetUpdateState();
+        if (u.phase == UpdaterState::Failed && !g.exitNote.empty()) {
+            g.exitNote.clear();                      // the "installing…" banner no longer applies
+            UpdateStatus(GetMonitorState());
+        }
+        if (g.visible && g.page == PageSettings) SyncUpdateState();
+        if (u.phase == UpdaterState::Available && u.latest != g.announcedUpdate) {
+            g.announcedUpdate = u.latest;
+            if (u.willAutoInstall)
+                Balloon(L"Updating NetVigil", L"Version " + u.latest + L" is being installed. "
+                        L"NetVigil restarts in the tray in a moment.");
+            else
+                Balloon(L"NetVigil update available",
+                        L"Version " + u.latest + L" is ready. Open Settings to install it.");
+        }
         break;
     }
     case UiStopped:
@@ -768,6 +859,22 @@ void OnCommand(int id)
         }
         g.exitNote = L"Installing at startup — NetVigil will restart in the tray…";
         UpdateStatus(GetMonitorState());
+        break;
+    case ID_BTN_CHECKUPD:
+        RequestUpdateCheck();
+        break;
+    case ID_BTN_INSTALLUPD:
+        if (!GetUpdateState().canInstallHere) {   // a portable copy: point at the download
+            OpenReleasesPage();
+            break;
+        }
+        if (RequestUpdateInstall()) {
+            g.exitNote = L"Installing the update — NetVigil will restart in the tray…";
+            UpdateStatus(GetMonitorState());
+        }
+        break;
+    case ID_CHK_AUTOUPD:
+        SetAutoUpdate(IsDlgButtonChecked(g.hwnd, ID_CHK_AUTOUPD) == BST_CHECKED);
         break;
     case ID_BTN_UNINSTALL: {
         int r = MessageBoxW(g.hwnd,
@@ -919,7 +1026,7 @@ int RunGui(HINSTANCE hInst, bool startHidden)
         return 1;
     }
 
-    RECT r{ 0, 0, S(600), S(480) };
+    RECT r{ 0, 0, S(600), S(560) };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRectEx(&r, style, FALSE, 0);
     HWND hwnd = CreateWindowExW(0, kWndClass, L"NetVigil", style,

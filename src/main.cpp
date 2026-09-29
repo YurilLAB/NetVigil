@@ -3611,7 +3611,9 @@ static int StartMonitorGui(HINSTANCE hInst, bool startHidden, bool autostart, DW
     LoadConfig(intervalArg);
     if (autostart) Logf(L"started by the startup task");
     EnableDpiAwareness();
+    StartUpdater();
     int rc = RunGui(hInst, startHidden);
+    StopUpdater();      // before the stop event goes away: the updater polls it
 
     if (g_stopEvent) {
         HANDLE ev = g_stopEvent;
@@ -3740,6 +3742,37 @@ static bool LaunchDetached(const std::wstring& exe, const std::wstring& args, bo
 static bool IsRunningInstalledCopy()
 {
     return _wcsicmp(ExePath().c_str(), InstalledExe().c_str()) == 0;
+}
+
+// ---------------------------------------------------- services for update.cpp
+// (declared there; kept out of core.h so the GUI cannot reach them)
+
+bool CoreElevated() { return g_elevated; }
+bool CoreInstalledCopyRunning() { return IsRunningInstalledCopy(); }
+std::wstring CoreInstallDir() { return InstallDirPath(); }
+std::wstring CoreInstalledExe() { return InstalledExe(); }
+bool CoreStopRequested() { return StopRequested(); }
+void CoreNotify(UiEvent ev, LPARAM lp) { NotifyUi(ev, lp); }
+
+int CoreReadSettingInt(const wchar_t* key, int fallback)
+{
+    if (g_iniPath.empty()) return fallback;
+    return (int)GetPrivateProfileIntW(L"settings", key, fallback, g_iniPath.c_str());
+}
+
+void CoreSaveSetting(const wchar_t* key, const std::wstring& value) { SaveSetting(key, value); }
+
+// The verified, staged update exe installs itself: it stops the running
+// instance, replaces the installed exe atomically and re-registers the task.
+bool CoreLaunchStagedInstaller(const std::wstring& exe)
+{
+    Logf(L"starting the installer for the update");
+    return LaunchDetached(exe, L"--install --interval " + std::to_wstring(GetIntervalMin()), false);
+}
+
+bool CoreLaunchElevated(const wchar_t* args)
+{
+    return LaunchDetached(ExePath(), args, true);
 }
 
 StartupStatus GetStartupStatus()
@@ -4154,6 +4187,8 @@ static void PrintHelp()
         "  NetVigil.exe --install       register + start the startup task (elevates)\n"
         "  NetVigil.exe --uninstall     stop the monitor and remove the task\n"
         "  NetVigil.exe --stop          signal a running monitor to exit\n"
+        "  NetVigil.exe --check-update  look for a newer signed release (changes nothing)\n"
+        "  NetVigil.exe --update        install the newer signed release (elevates)\n"
         "  NetVigil.exe --status        adapters, probes, startup task, and a diagnosis\n"
         "                               with its repair plan (changes nothing)\n"
         "  NetVigil.exe --once          one check; diagnose and repair if needed; exit\n"
@@ -4246,7 +4281,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
-    enum class Mode { Monitor, Once, Status, Install, Uninstall, Stop, Help };
+    enum class Mode { Monitor, Once, Status, Install, Uninstall, Stop, CheckUpdate, Update, Help };
     Mode mode = Mode::Monitor;
     bool tray = false, autostart = false;
     DWORD interval = kDefaultIntervalMin;
@@ -4261,6 +4296,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         else if (a == L"--install")   mode = Mode::Install;
         else if (a == L"--uninstall") mode = Mode::Uninstall;
         else if (a == L"--stop")      mode = Mode::Stop;
+        else if (a == L"--check-update") mode = Mode::CheckUpdate;
+        else if (a == L"--update")    mode = Mode::Update;
         else if (a == L"--help" || a == L"-h" || a == L"/?") mode = Mode::Help;
         else if (a == L"--interval" && i + 1 < argc) {
             unsigned long v = wcstoul(argv[++i], nullptr, 10);
@@ -4283,6 +4320,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     case Mode::Install:   rc = CmdInstall(interval); break;
     case Mode::Uninstall: rc = CmdUninstall();       break;
     case Mode::Stop:      rc = CmdStop();            break;
+    case Mode::CheckUpdate: rc = CmdCheckUpdate();   break;
+    case Mode::Update:    rc = CmdUpdate();          break;
     case Mode::Help:      PrintHelp();               break;
     default:              rc = StartMonitorGui(hInst, tray, autostart, interval); break;
     }

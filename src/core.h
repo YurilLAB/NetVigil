@@ -99,8 +99,31 @@ std::vector<std::wstring> GetLogSince(unsigned long long& seq);
 // The worker posts `msg` to `hwnd` with one of these in wParam.
 // UiAdvice: lParam = nv::Fault the user should hear about (see MonitorState).
 enum UiEvent : WPARAM { UiStateChanged = 1, UiLogAppended, UiRestored, UiFailed, UiStopped,
-                        UiAdvice };
+                        UiAdvice, UiUpdate };
 void SetUiNotify(HWND hwnd, UINT msg);
+
+// ---- self-update (update.cpp). Everything here is safe to call from the UI thread;
+// the network work happens on the updater's own thread and posts UiUpdate.
+struct UpdaterState {
+    enum Phase { Idle, Checking, UpToDate, Available, Applying, Failed };
+    Phase phase = Idle;
+    std::wstring latest;             // newest signed version seen, "1.2.3"
+    std::wstring detail;             // why the last check/install failed
+    long long checkedAt = 0;         // unix seconds of the last completed check, 0 = never
+    bool canInstallHere = false;     // an installed copy exists, so it can be updated in place
+    bool willAutoInstall = false;    // automatic updates are on AND this process may apply them
+};
+const wchar_t* AppVersion();         // "1.0.0"
+UpdaterState GetUpdateState();
+void RequestUpdateCheck();           // check now, in the background
+bool RequestUpdateInstall();         // install the available update (UAC if needed)
+bool GetAutoUpdate();
+void SetAutoUpdate(bool on);
+void OpenReleasesPage();             // for copies that cannot be updated in place
+void StartUpdater();                 // called by the core once settings are loaded
+void StopUpdater();
+int  CmdCheckUpdate();               // --check-update
+int  CmdUpdate();                    // --update
 
 DWORD WINAPI MonitorThreadProc(LPVOID);
 

@@ -97,7 +97,7 @@ Requires Visual Studio (or Build Tools) with the C++ x64 toolset:
 
 ```bat
 build.bat          :: build\NetVigil.exe
-build.bat test     :: build and run the diagnosis unit tests
+build.bat test     :: build and run the unit tests (diagnosis + update verification)
 ```
 
 Produces `build\NetVigil.exe` (x64, no console window; it attaches to your
@@ -121,6 +121,8 @@ NetVigil.exe --interval N    check every N minutes (1-1440; persisted in netvigi
 NetVigil.exe --install       register + start the startup task (prompts for UAC)
 NetVigil.exe --uninstall     stop the watchdog and remove the task
 NetVigil.exe --stop          signal the running watchdog to exit
+NetVigil.exe --check-update  look for a newer signed release — changes nothing
+NetVigil.exe --update        install the newer signed release (prompts for UAC)
 NetVigil.exe --status        adapters, probes, startup task, and a diagnosis with its
                              repair plan — changes nothing
 NetVigil.exe --once          one check; diagnose and repair if needed; exit
@@ -162,6 +164,44 @@ defaults are wrong for a watchdog:
 The task must never point at a user-writable directory where any process
 running as you could swap the binary — hence the `%ProgramFiles%` copy.
 `--uninstall` removes the task and that copy.
+
+## Updates
+
+The running copy checks GitHub for a newer release a minute and a half after it
+starts and then once a day (retrying hourly after a failure), and only while
+the connection is up and no repair is running. What it does with one:
+
+- **Automatic (default).** An elevated installed copy downloads, verifies and
+  installs the update itself, then restarts in the tray — no prompt. Turn it
+  off in *Settings → Install updates automatically*.
+- **Manual.** *Settings → Check for updates* / *Install update…*; a copy that is
+  not running elevated asks for UAC and an elevated helper redoes the whole
+  check. A copy that was never installed at startup cannot update itself, so
+  the button opens the release page instead.
+- **From a terminal:** `--check-update` (exit code 0 up to date, 10 available,
+  1 failed) and `--update`.
+
+An update is used **only** if its `manifest.txt` carries a valid ECDSA P-256
+signature from the release key compiled into the exe, its version is newer
+than the running one, and the downloaded exe has exactly the signed size and
+SHA-256. HTTPS is defence in depth, not the trust anchor. Details, and what is
+deliberately *not* protected, are in [SECURITY.md](SECURITY.md).
+
+Publishing a release is `tools\release.ps1 -Version X.Y.Z -Publish` (bump
+`src\version.h` first). It builds, runs the tests, signs with the DPAPI-protected
+key from `tools\new-signing-key.ps1`, and refuses to publish unless the signed
+manifest verifies against the key compiled into that very exe.
+
+## Security
+
+NetVigil runs elevated while everything else you run does not, so it is built
+not to trust anything an unprivileged process can influence: its data folder
+is checked and pinned against junction swaps, its log and settings are never
+written through a link, its install location and update channel do not come
+from overridable environment variables, its mutex/stop-event permissions are
+scoped to you, and the exe ships with control-flow guard, CET, ASLR, DEP and
+System32-only DLL loading. See [SECURITY.md](SECURITY.md) for the full list,
+the limits, and how to report a problem.
 
 ## The window
 
