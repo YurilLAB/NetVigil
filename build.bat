@@ -28,7 +28,10 @@ if errorlevel 1 exit /b 1
 if not exist build mkdir build
 if "%TARGET%"=="test" goto :test
 
-cl /nologo /utf-8 /W4 /O2 /GL /EHsc /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 src\main.cpp src\gui.cpp src\diagnose.cpp src\startup.cpp src\proxy.cpp /Fo:build\ /Fe:build\NetVigil.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /LTCG /OPT:REF /OPT:ICF
+rem Hardening: /GS (default) + /guard:cf (control-flow guard) + /sdl (extra runtime checks);
+rem at link time ASLR (high entropy), DEP, CET shadow stacks, and System32-only loading of
+rem every DLL the exe imports (DEPENDENTLOADFLAG 0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32).
+cl /nologo /utf-8 /W4 /O2 /GL /EHsc /std:c++17 /GS /guard:cf /sdl /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 src\main.cpp src\gui.cpp src\diagnose.cpp src\startup.cpp src\proxy.cpp /Fo:build\ /Fe:build\NetVigil.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /LTCG /OPT:REF /OPT:ICF /guard:cf /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /CETCOMPAT /DEPENDENTLOADFLAG:0x800
 if errorlevel 1 exit /b 1
 echo.
 echo Built build\NetVigil.exe
@@ -38,3 +41,7 @@ exit /b 0
 cl /nologo /utf-8 /W4 /EHsc /std:c++17 /Isrc tests\diagnose_tests.cpp src\diagnose.cpp /Fo:build\ /Fe:build\diagnose_tests.exe
 if errorlevel 1 exit /b 1
 build\diagnose_tests.exe
+if errorlevel 1 exit /b 1
+cl /nologo /utf-8 /W4 /EHsc /std:c++17 /Isrc tests\update_tests.cpp src\updatecore.cpp /Fo:build\ /Fe:build\update_tests.exe
+if errorlevel 1 exit /b 1
+build\update_tests.exe

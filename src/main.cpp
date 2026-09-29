@@ -29,6 +29,9 @@
 #include <cfgmgr32.h>
 #include <windns.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <knownfolders.h>
+#include <userenv.h>
 #include <sddl.h>
 
 #include <cstddef>
@@ -59,6 +62,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "userenv.lib")
 
 bool DisableManualProxy(std::wstring* previous); // proxy.cpp
 
@@ -165,20 +169,40 @@ static std::wstring Sys32(const wchar_t* exe)
     return std::wstring(s) + L"\\" + exe;
 }
 
+static bool g_logRefusedNote = false;   // tell the user once that file logging was switched off
+
+// The log lives in a folder the non-elevated user fully controls while this
+// process may be elevated, so it must never be written THROUGH a link: open
+// the file itself (not what a symlink points at) and refuse anything that is a
+// reparse point, a directory, or hard-linked to some other name.
+static HANDLE OpenLogForAppend()
+{
+    HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+        info.nNumberOfLinks > 1) {
+        CloseHandle(h);
+        g_logPath.clear();              // no file logging for the rest of this run
+        g_logRefusedNote = true;
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
 static void AppendLogFile(const std::string& bytes)
 {
-    HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA,
-                           FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE h = OpenLogForAppend();
     if (h == INVALID_HANDLE_VALUE) return;
     LARGE_INTEGER sz{};
     if (GetFileSizeEx(h, &sz) && (ULONGLONG)sz.QuadPart > kLogRotateBytes) {
         CloseHandle(h);
         MoveFileExW(g_logPath.c_str(), (g_logPath + L".old").c_str(),
                     MOVEFILE_REPLACE_EXISTING);
-        h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA,
-                        FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        h = OpenLogForAppend();
         if (h == INVALID_HANDLE_VALUE) return;
     }
     DWORD written = 0;
@@ -194,7 +218,12 @@ static void LogLine(const std::wstring& msg)
     wchar_t stamp[40];
     swprintf_s(stamp, L"%04u-%02u-%02u %02u:%02u:%02u  ",
                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    std::wstring line = std::wstring(stamp) + msg;
+    // Network-supplied text (SSIDs, profile names) reaches the log: a control
+    // character in it must not be able to forge a line of its own.
+    std::wstring clean = msg;
+    for (auto& c : clean)
+        if (c < 0x20 || c == 0x7f) c = L'?';
+    std::wstring line = std::wstring(stamp) + clean;
     std::string console = WideToUtf8(line + L"\n");
 
     EnterCriticalSection(&g_logCs);
@@ -204,9 +233,14 @@ static void LogLine(const std::wstring& msg)
     if (g_logRing.size() > kLogRingMax) g_logRing.pop_front();
     ++g_logSeq;
     if (!g_logPath.empty()) AppendLogFile(WideToUtf8(line + L"\r\n"));
+    bool note = g_logRefusedNote;
+    g_logRefusedNote = false;
     LeaveCriticalSection(&g_logCs);
 
     NotifyUi(UiLogAppended);
+    if (note)
+        Logf(L"the log file is a link or is hard-linked elsewhere — refusing to write through it; "
+             L"file logging is off for this run (this window still shows the log)");
 }
 
 void Logf(const wchar_t* fmt, ...)
@@ -244,16 +278,72 @@ static void InitCore()
     g_hintEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
 
+// The signed-in user's profile folder as recorded in HKLM (admin-writable
+// only) — not %LOCALAPPDATA% and not the per-user shell-folder values, both of
+// which a non-elevated process can rewrite to steer an elevated one.
+static std::wstring ProfileDir()
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return L"";
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = MAX_PATH;
+    BOOL ok = GetUserProfileDirectoryW(tok, buf, &n);
+    CloseHandle(tok);
+    return ok ? std::wstring(buf) : std::wstring();
+}
+
+static HANDLE g_dataDirGuard = nullptr;   // held for the process lifetime
+
+// The settings/log folder is inside the user's profile, so a non-elevated
+// process can replace it with a junction pointing somewhere only admins may
+// write — and an elevated NetVigil would then create files there. Refuse a
+// link, and keep the folder open WITHOUT delete-sharing so it cannot be
+// renamed or swapped for one while this process runs.
+static bool SecureDataDir(const std::wstring& dir)
+{
+    CreateDirectoryW(dir.c_str(), nullptr);
+    HANDLE h = CreateFileW(dir.c_str(), FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    bool ok = GetFileInformationByHandle(h, &info) &&
+              (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+              !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+    if (!ok) {
+        CloseHandle(h);
+        return false;
+    }
+    g_dataDirGuard = h;
+    return true;
+}
+
 static void InitLog()
 {
-    wchar_t buf[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(buf) + L"\\NetVigil"
-                                               : ExeDir();
-    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring dir;
+    std::wstring prof = ProfileDir();
+    if (!prof.empty() && GetFileAttributesW((prof + L"\\AppData\\Local").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        dir = prof + L"\\AppData\\Local\\NetVigil";
+    } else {
+        PWSTR known = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &known)) && known)
+            dir = std::wstring(known) + L"\\NetVigil";
+        else
+            dir = ExeDir();
+        CoTaskMemFree(known);
+    }
     g_dataDir = dir;
-    g_logPath = dir + L"\\netvigil.log";
-    g_iniPath = dir + L"\\netvigil.ini";
+    if (SecureDataDir(dir)) {
+        g_logPath = dir + L"\\netvigil.log";
+        g_iniPath = dir + L"\\netvigil.ini";
+    } else {
+        // Run without persistence rather than write through a link: no file
+        // log, no saved settings (an empty ini path just yields the defaults).
+        g_logPath.clear();
+        g_iniPath.clear();
+        Logf(L"the data folder %ls is a link or cannot be secured — settings and the log "
+             L"file are switched off for this run", dir.c_str());
+    }
 }
 
 const std::wstring& DataDir() { return g_dataDir; }
@@ -353,21 +443,30 @@ static bool RunBounded(DWORD ms, std::function<void()> fn)
 // launch run non-elevated. An elevated token's default DACL grants only
 // Administrators/SYSTEM, which would make the named mutex/event unopenable
 // from a normal shell — so both are created with an explicit DACL that also
-// grants the interactive session access.
-static SECURITY_ATTRIBUTES* NamedObjSa()
+// lets the signed-in user in, and ONLY with the rights the other side needs:
+//   mutex  SYNCHRONIZE                       (is an instance running?)
+//   event  SYNCHRONIZE | EVENT_MODIFY_STATE  (--stop)
+// No other interactive user, and no delete/write-DAC, is granted anything.
+static SECURITY_ATTRIBUTES* NamedObjSa(bool forEvent)
 {
-    static PSECURITY_DESCRIPTOR sd = nullptr;
-    static SECURITY_ATTRIBUTES sa{};
-    if (!sd) {
+    static PSECURITY_DESCRIPTOR sd[2] = {};
+    static SECURITY_ATTRIBUTES sa[2] = {};
+    const int i = forEvent ? 1 : 0;
+    if (!sd[i]) {
+        const std::wstring rights = forEvent ? L"0x00100002" : L"0x00100000";
+        std::wstring sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)";
+        std::wstring session = SessionUserSid(nullptr);   // who is signed in on this desktop
+        std::wstring self = ProcessUserSid();              // who this token is
+        if (!session.empty()) sddl += L"(A;;" + rights + L";;;" + session + L")";
+        if (!self.empty() && self != session) sddl += L"(A;;" + rights + L";;;" + self + L")";
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)",
-                SDDL_REVISION_1, &sd, nullptr))
+                sddl.c_str(), SDDL_REVISION_1, &sd[i], nullptr))
             return nullptr; // fall back to default security
-        sa.nLength = sizeof sa;
-        sa.lpSecurityDescriptor = sd;
-        sa.bInheritHandle = FALSE;
+        sa[i].nLength = sizeof sa[i];
+        sa[i].lpSecurityDescriptor = sd[i];
+        sa[i].bInheritHandle = FALSE;
     }
-    return &sa;
+    return &sa[i];
 }
 
 // ------------------------------------------------- RAII resource wrappers
@@ -583,8 +682,32 @@ static bool IniSafeKey(const std::wstring& k)
 
 // WritePrivateProfileStringW only preserves non-ASCII (SSIDs!) in a file that
 // is already UTF-16LE — create it with a BOM before first use.
+// The ini sits in the user-writable data folder but is written by a possibly
+// elevated process: never write through a link (or over a directory).
+static bool IniFileSafe()
+{
+    if (g_iniPath.empty()) return false;
+    DWORD a = GetFileAttributesW(g_iniPath.c_str());   // describes the link itself, not its target
+    if (a == INVALID_FILE_ATTRIBUTES) return true;      // not created yet
+    return !(a & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY));
+}
+
+static BOOL IniWrite(const wchar_t* section, const wchar_t* key, const wchar_t* value)
+{
+    if (!IniFileSafe()) {
+        if (!g_iniPath.empty()) {
+            Logf(L"the settings file is a link — refusing to write through it; "
+                 L"settings are switched off for this run");
+            g_iniPath.clear();
+        }
+        return FALSE;
+    }
+    return WritePrivateProfileStringW(section, key, value, g_iniPath.c_str());
+}
+
 static void EnsureUnicodeIni()
 {
+    if (!IniFileSafe()) return;
     if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
     ScopedHandle f(CreateFileW(g_iniPath.c_str(), GENERIC_WRITE, 0, nullptr,
                                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -612,7 +735,7 @@ static std::vector<std::pair<std::wstring, std::wstring>> ReadIniSection(const w
 static void SaveSetting(const wchar_t* key, const std::wstring& value)
 {
     EnsureUnicodeIni();
-    WritePrivateProfileStringW(L"settings", key, value.c_str(), g_iniPath.c_str());
+    IniWrite(L"settings", key, value.c_str());
 }
 
 static long long ReadSettingInt64(const wchar_t* key)
@@ -655,7 +778,7 @@ static void SaveSeen(const std::wstring& profile, const SeenInfo& s)
 {
     std::wstring v = std::to_wstring(s.lastSeen) + L"|" +
                      std::to_wstring(s.connects) + L"|" + s.ssid;
-    WritePrivateProfileStringW(L"seen", profile.c_str(), v.c_str(), g_iniPath.c_str());
+    IniWrite(L"seen", profile.c_str(), v.c_str());
 }
 
 // Remember the network the machine is on. Writes only on a change of
@@ -704,18 +827,16 @@ void SetNetworkMode(const std::wstring& profile, NetMode mode)
         for (auto& kv : g_modes) {
             if (kv.second == NetMode::Preferred && kv.first != profile) {
                 kv.second = NetMode::Allowed;
-                WritePrivateProfileStringW(L"networks", kv.first.c_str(), nullptr,
-                                           g_iniPath.c_str());
+                IniWrite(L"networks", kv.first.c_str(), nullptr);
             }
         }
     }
     if (mode == NetMode::Allowed) {
         g_modes.erase(profile);
-        WritePrivateProfileStringW(L"networks", profile.c_str(), nullptr, g_iniPath.c_str());
+        IniWrite(L"networks", profile.c_str(), nullptr);
     } else {
         g_modes[profile] = mode;
-        WritePrivateProfileStringW(L"networks", profile.c_str(), ModeStr(mode),
-                                   g_iniPath.c_str());
+        IniWrite(L"networks", profile.c_str(), ModeStr(mode));
     }
     LeaveCriticalSection(&g_cfgCs);
     Logf(L"network '%ls' set to: %ls", profile.c_str(), ModeStr(mode));
@@ -761,7 +882,7 @@ static void MarkUserExit()
 
 static void ClearUserExit()
 {
-    WritePrivateProfileStringW(L"settings", L"exitedLogon", nullptr, g_iniPath.c_str());
+    IniWrite(L"settings", L"exitedLogon", nullptr);
 }
 
 static bool UserExitedThisSession()
@@ -796,9 +917,7 @@ static void IniBump(const wchar_t* section, const std::wstring& key)
 {
     if (!IniSafeKey(key)) return;
     EnsureUnicodeIni();
-    WritePrivateProfileStringW(section, key.c_str(),
-                               std::to_wstring(IniCount(section, key) + 1).c_str(),
-                               g_iniPath.c_str());
+    IniWrite(section, key.c_str(), std::to_wstring(IniCount(section, key) + 1).c_str());
 }
 
 static std::wstring RepairStats()
@@ -3359,6 +3478,18 @@ static bool TakeOverFromNonElevated()
     return WaitInstanceExit(30000);
 }
 
+// True if a NetVigil window exists now or appears within `ms` (a copy that is
+// still starting up creates its window within moments).
+static bool WindowAppears(DWORD ms)
+{
+    ULONGLONG end = GetTickCount64() + ms;
+    for (;;) {
+        if (FindWindowW(kWndClass, nullptr)) return true;
+        if (GetTickCount64() >= end) return false;
+        Sleep(200);
+    }
+}
+
 // A copy is running but owns no window: an older build that predates the GUI
 // (typically the one the logon task started), or one still starting up. This
 // is a windowed app, so silently exiting would look like "nothing happened" —
@@ -3366,11 +3497,7 @@ static bool TakeOverFromNonElevated()
 // the running copy is gone and this instance may take over.
 static bool ReplaceWindowlessInstance()
 {
-    // A copy that is merely mid-startup gets its window within moments.
-    for (int i = 0; i < 8; ++i) {
-        if (FindWindowW(kWndClass, nullptr)) return false; // caller hands off to it
-        Sleep(250);
-    }
+    if (WindowAppears(2000)) return false;   // caller hands off to it
     int answer = MessageBoxW(nullptr,
         L"NetVigil is already running in the background, but that copy has no "
         L"window. It is an older version, most likely the one started at sign-in.\n\n"
@@ -3414,22 +3541,41 @@ static int StartMonitorGui(HINSTANCE hInst, bool startHidden, bool autostart, DW
     // "Exit" in the tray means exit until the next sign-in.
     if (autostart && UserExitedThisSession()) return 0;
 
-    SECURITY_ATTRIBUTES* sa = NamedObjSa();
-    g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
+    SECURITY_ATTRIBUTES* saMutex = NamedObjSa(false);
+    SECURITY_ATTRIBUTES* saEvent = NamedObjSa(true);
+    g_instanceMutex.reset(CreateMutexW(saMutex, FALSE, kMutexName));
     DWORD mutexErr = GetLastError();
     bool running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
     if (running && autostart && g_elevated) {
         g_instanceMutex.reset();
-        if (TakeOverFromNonElevated()) {
-            g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
+        bool lockFree = TakeOverFromNonElevated();
+        bool failOpen = false;
+        if (!lockFree && !WindowAppears(2000)) {
+            // The lock is held but nothing owns a NetVigil window: an old copy
+            // without a GUI — or a process that took the name to keep the
+            // watchdog from ever starting. Ask it to stop; if it will not, start
+            // anyway (without the lock) rather than leave the machine unwatched.
+            Logf(L"the single-instance lock is held by something with no NetVigil window — "
+                 L"asking it to stop");
+            SignalRunningInstance();
+            lockFree = WaitInstanceExit(10000);
+            failOpen = !lockFree;
+            if (failOpen)
+                Logf(L"it did not stop — starting without the single-instance lock");
+        }
+        if (failOpen) {
+            running = false;                 // g_instanceMutex stays empty: no lock held
+        } else if (lockFree) {
+            g_instanceMutex.reset(CreateMutexW(saMutex, FALSE, kMutexName));
             mutexErr = GetLastError();
             running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
         }
+        // else: an elevated NetVigil with a window is already running — hand off below
     }
     if (running && !autostart && !startHidden && !FindWindowW(kWndClass, nullptr)) {
         g_instanceMutex.reset(); // our handle would keep the old mutex alive
         if (ReplaceWindowlessInstance()) {
-            g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
+            g_instanceMutex.reset(CreateMutexW(saMutex, FALSE, kMutexName));
             mutexErr = GetLastError();
             running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
         }
@@ -3454,7 +3600,7 @@ static int StartMonitorGui(HINSTANCE hInst, bool startHidden, bool autostart, DW
     }
     if (!autostart) ClearUserExit(); // started by hand: automatic relaunch applies again
 
-    g_stopEvent = CreateEventW(sa, TRUE, FALSE, kStopEventName);
+    g_stopEvent = CreateEventW(saEvent, TRUE, FALSE, kStopEventName);
     DWORD evErr = GetLastError();
     if (!g_stopEvent)
         Logf(L"warning: stop event unavailable (%u) — --stop will not reach "
@@ -3550,11 +3696,19 @@ static bool WaitInstanceStart(DWORD ms)
 
 // Admin-writable-only home for the installed copy. The logon task runs
 // elevated, so it must never point at an exe a non-admin process can swap.
+//
+// Asked of the shell's known-folder API (HKLM), never of %ProgramFiles%: a
+// user-level environment variable overrides that one, which would let a
+// non-elevated process steer an elevated --install into a folder it controls
+// and then have the logon task run whatever it left there as admin.
 static std::wstring InstallDirPath()
 {
-    wchar_t buf[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableW(L"ProgramFiles", buf, MAX_PATH);
-    std::wstring pf = (n > 0 && n < MAX_PATH) ? buf : L"C:\\Program Files";
+    std::wstring pf;
+    PWSTR known = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, nullptr, &known)) && known)
+        pf = known;
+    CoTaskMemFree(known);
+    if (pf.empty()) pf = L"C:\\Program Files";
     return pf + L"\\NetVigil";
 }
 
@@ -3624,25 +3778,15 @@ bool LaunchInstaller()
                           !g_elevated);
 }
 
+// The installed copy removes itself: its files are marked for deletion at the
+// next reboot (CmdUninstall). It used to copy itself into %TEMP% and run the
+// copy elevated — a user-writable folder, so a non-elevated process could swap
+// that file between the copy and the elevated launch. Nothing elevated is ever
+// run from a location a normal user can write to now.
 bool LaunchUninstaller()
 {
-    std::wstring helper = ExePath();
-    std::wstring args = L"--uninstall";
-    if (IsRunningInstalledCopy()) {
-        // We ARE the installed copy: a helper copy in %TEMP% does the removal
-        // and deletes itself at the next reboot.
-        wchar_t tmp[MAX_PATH] = {};
-        if (!GetTempPathW(MAX_PATH, tmp)) return false;
-        std::wstring tmpExe = std::wstring(tmp) + L"NetVigil-uninstall.exe";
-        if (!CopyFileW(helper.c_str(), tmpExe.c_str(), FALSE)) {
-            Logf(L"could not create the uninstall helper (%u)", GetLastError());
-            return false;
-        }
-        helper = tmpExe;
-        args += L" --helper";
-    }
     Logf(L"uninstall requested from the window");
-    return LaunchDetached(helper, args, !g_elevated);
+    return LaunchDetached(ExePath(), L"--uninstall", !g_elevated);
 }
 
 static bool RelaunchElevated(const wchar_t* args)
@@ -3910,7 +4054,8 @@ static int CmdStatus()
     Logf(L"NetVigil status");
     Logf(L"  exe:       %ls", ExePath().c_str());
     Logf(L"  elevated:  %ls", g_elevated ? L"yes" : L"no");
-    Logf(L"  log:       %ls", g_logPath.c_str());
+    Logf(L"  installs:  %ls", InstalledExe().c_str());
+    Logf(L"  log:       %ls", g_logPath.empty() ? L"(off — data folder unsafe)" : g_logPath.c_str());
     StartupTaskInfo t;
     std::wstring err;
     if (!QueryStartupTask(t, &err))
@@ -4046,9 +4191,44 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// Process-level hardening, applied before anything else runs. Each policy is
+// best-effort: an older Windows refuses one it does not have and we carry on.
+// Deliberately NOT enabled (each would break or endanger this program): child
+// process restrictions (it runs schtasks/ipconfig/...), win32k/system-call
+// lockdown (it is a GUI with a tray icon), dynamic-code and signature-only
+// policies (in-process shell/IME/security-software DLLs would fault), and
+// strict handle checks (a stray invalid handle would kill the watchdog).
+static void HardenProcess(bool elevated)
+{
+    // DLLs load from System32 only — a DLL planted beside a copy that is run
+    // from a user-writable folder can never be picked up.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    SetDllDirectoryW(L"");
+
+    PROCESS_MITIGATION_IMAGE_LOAD_POLICY img{};
+    img.NoRemoteImages = 1;              // nothing from a network share
+    img.NoLowMandatoryLabelImages = 1;   // nothing a low-integrity process could have written
+    img.PreferSystem32Images = 1;
+    SetProcessMitigationPolicy(ProcessImageLoadPolicy, &img, sizeof img);
+
+    PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY ext{};
+    ext.DisableExtensionPoints = 1;      // no AppInit DLLs, legacy IMEs, winsock LSPs, ...
+    SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, &ext, sizeof ext);
+
+    if (elevated) {
+        // Windows 11 "redirection guard": an elevated process refuses to follow a
+        // junction that a non-admin created (the data folder, temp files, ...).
+        PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY rt{};
+        rt.EnforceRedirectionTrust = 1;
+        SetProcessMitigationPolicy(ProcessRedirectionTrustPolicy, &rt, sizeof rt);
+    }
+}
+
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
     HeapSetInformation(nullptr, HeapEnableTerminationOnCorruption, nullptr, 0);
+    g_elevated = IsElevated();
+    HardenProcess(g_elevated);
     InitCore();
     BindConsole();
     InitLog();
@@ -4061,7 +4241,6 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         Logf(L"WSAStartup failed (%d) — continuing without the TCP and DNS probes", wsaRc);
     g_queryUnbiased = (PfnQueryUnbiased)(void*)GetProcAddress(
         GetModuleHandleW(L"kernel32.dll"), "QueryUnbiasedInterruptTime");
-    g_elevated = IsElevated();
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
     int argc = 0;

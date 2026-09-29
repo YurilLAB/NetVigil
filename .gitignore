@@ -2,3 +2,8 @@ build/
 *.log
 *.old
 *.obj
+dist/
+*.dpapi
+*.key
+*.pem
+*.pfx
