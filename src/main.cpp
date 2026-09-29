@@ -3338,7 +3338,7 @@ static void EnableDpiAwareness()
     if (!set || !set(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)) SetProcessDPIAware();
 }
 
-static void SignalRunningInstance();        // fwd (task mgmt)
+static bool SignalRunningInstance();        // fwd (task mgmt)
 static bool WaitInstanceExit(DWORD ms);     // fwd
 
 // The startup task runs elevated; if the user started a normal copy first,
@@ -3359,6 +3359,52 @@ static bool TakeOverFromNonElevated()
     return WaitInstanceExit(30000);
 }
 
+// A copy is running but owns no window: an older build that predates the GUI
+// (typically the one the logon task started), or one still starting up. This
+// is a windowed app, so silently exiting would look like "nothing happened" —
+// ask instead, and replace the old copy if the user agrees. Returns true when
+// the running copy is gone and this instance may take over.
+static bool ReplaceWindowlessInstance()
+{
+    // A copy that is merely mid-startup gets its window within moments.
+    for (int i = 0; i < 8; ++i) {
+        if (FindWindowW(kWndClass, nullptr)) return false; // caller hands off to it
+        Sleep(250);
+    }
+    int answer = MessageBoxW(nullptr,
+        L"NetVigil is already running in the background, but that copy has no "
+        L"window. It is an older version, most likely the one started at sign-in.\n\n"
+        L"Stop it and open this version instead?",
+        L"NetVigil", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST);
+    if (answer != IDYES) {
+        Logf(L"another NetVigil instance is already running (no window) — left it running");
+        return false;
+    }
+    if (!SignalRunningInstance()) {
+        DWORD err = GetLastError();
+        Logf(L"could not reach the running instance to stop it (%u)", err);
+        MessageBoxW(nullptr,
+            err == ERROR_ACCESS_DENIED
+                ? L"Could not stop the running copy — it is running as administrator.\n\n"
+                  L"End \"NetVigil.exe\" in Task Manager (Details tab), or start this "
+                  L"version as administrator, then try again."
+                : L"Could not stop the running copy — it does not respond to a stop request.\n\n"
+                  L"End \"NetVigil.exe\" in Task Manager (Details tab), then try again.",
+            L"NetVigil", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        return false;
+    }
+    if (!WaitInstanceExit(20000)) {
+        Logf(L"running instance did not exit within 20 s");
+        MessageBoxW(nullptr,
+            L"The running copy did not stop in time. End \"NetVigil.exe\" in Task "
+            L"Manager (Details tab) and try again.",
+            L"NetVigil", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        return false;
+    }
+    Logf(L"replaced the running windowless instance");
+    return true;
+}
+
 // Monitor mode: claim the single instance (or hand off to the running one),
 // create the control events, load config and run the tray/window front end
 // with the watchdog on a worker thread. `autostart` = launched by the
@@ -3375,6 +3421,14 @@ static int StartMonitorGui(HINSTANCE hInst, bool startHidden, bool autostart, DW
     if (running && autostart && g_elevated) {
         g_instanceMutex.reset();
         if (TakeOverFromNonElevated()) {
+            g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
+            mutexErr = GetLastError();
+            running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
+        }
+    }
+    if (running && !autostart && !startHidden && !FindWindowW(kWndClass, nullptr)) {
+        g_instanceMutex.reset(); // our handle would keep the old mutex alive
+        if (ReplaceWindowlessInstance()) {
             g_instanceMutex.reset(CreateMutexW(sa, FALSE, kMutexName));
             mutexErr = GetLastError();
             running = !g_instanceMutex.valid() || mutexErr == ERROR_ALREADY_EXISTS;
@@ -3453,14 +3507,14 @@ static DWORD RunProcess(const std::wstring& cmdLine, bool quiet)
     return code;
 }
 
-static void SignalRunningInstance()
+static bool SignalRunningInstance()
 {
     HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, kStopEventName);
-    if (ev) {
-        SetEvent(ev);
-        CloseHandle(ev);
-        Logf(L"stop signal sent to running instance");
-    }
+    if (!ev) return false; // GetLastError() says why (ACCESS_DENIED = other privilege level)
+    SetEvent(ev);
+    CloseHandle(ev);
+    Logf(L"stop signal sent to running instance");
+    return true;
 }
 
 static bool InstanceRunning()
